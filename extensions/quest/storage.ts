@@ -1,8 +1,7 @@
 import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { basename, join } from "node:path";
 import type { Quest, QuestTask } from "./types";
-import { ACTIVE_PATH, ARCHIVE_DIR, ARCHIVE_INDEX_PATH } from "./constants";
-import { readJSON, writeJSON, projectMemoryPath, loadProjectMemory } from "./utils";
+import { readJSON, writeJSON, projectMemoryPath, loadProjectMemory, questActivePath, questArchiveDir, questArchiveIndexPath } from "./utils";
 
 export function syncConventionsToMemory(quest: Quest, cwd: string): void {
 	try {
@@ -24,7 +23,6 @@ export function emptyQuest(name: string, goal: string, team?: string, planningMo
 		name,
 		goal,
 		status: "planning",
-		cwd: undefined,
 		tasks: [],
 		tasksSincePause: 0,
 		lastFiredTaskIndex: -1,
@@ -43,10 +41,11 @@ export function emptyQuest(name: string, goal: string, team?: string, planningMo
 	};
 }
 
-export function loadQuest(): Quest | null {
+export function loadQuest(cwd: string): Quest | null {
 	try {
-		if (!existsSync(ACTIVE_PATH)) return null;
-		const raw = JSON.parse(readFileSync(ACTIVE_PATH, "utf8"));
+		const activePath = questActivePath(cwd);
+		if (!existsSync(activePath)) return null;
+		const raw = JSON.parse(readFileSync(activePath, "utf8"));
 		if (raw && raw.version === 1 && Array.isArray(raw.tasks)) {
 			raw.tasks = raw.tasks.map((t: any) => ({
 				content: t.content || "",
@@ -107,18 +106,19 @@ export function loadQuest(): Quest | null {
 	return null;
 }
 
-export function saveQuest(quest: Quest): void {
+export function saveQuest(quest: Quest, cwd: string): void {
 	quest.updatedAt = Date.now();
-	writeJSON(ACTIVE_PATH, quest);
+	writeJSON(questActivePath(cwd), quest);
 }
 
-export function archiveQuest(quest: Quest): string | null {
+export function archiveQuest(quest: Quest, cwd: string): string | null {
 	try {
+		const archiveDir = questArchiveDir(cwd);
 		const slug = quest.name.replace(/[^a-z0-9-]+/gi, "-").toLowerCase();
 		const ts = quest.completedAt ?? Date.now();
-		const path = join(ARCHIVE_DIR, `${ts}-${slug}.json`);
+		const path = join(archiveDir, `${ts}-${slug}.json`);
 		writeJSON(path, quest);
-		updateArchiveIndex({
+		updateArchiveIndex(cwd, {
 			path,
 			name: quest.name,
 			goal: quest.goal,
@@ -130,27 +130,29 @@ export function archiveQuest(quest: Quest): string | null {
 	} catch (e) { console.error("[pi-quest] archiveQuest:", e); return null; }
 }
 
-function updateArchiveIndex(entry: { path: string; name: string; goal: string; completedAt: number; taskCount: number; doneCount: number }): void {
+function updateArchiveIndex(cwd: string, entry: { path: string; name: string; goal: string; completedAt: number; taskCount: number; doneCount: number }): void {
 	try {
-		const index = readJSON<{ version: 1; entries: any[] }>(ARCHIVE_INDEX_PATH, { version: 1, entries: [] });
+		const indexPath = questArchiveIndexPath(cwd);
+		const index = readJSON<{ version: 1; entries: any[] }>(indexPath, { version: 1, entries: [] });
 		index.entries = index.entries.filter((e: any) => e.path !== entry.path);
 		index.entries.push(entry);
 		index.entries.sort((a: any, b: any) => (b.completedAt || 0) - (a.completedAt || 0));
-		writeJSON(ARCHIVE_INDEX_PATH, index);
+		writeJSON(indexPath, index);
 	} catch (e) { console.error("[pi-quest] updateArchiveIndex:", e); /* best-effort */ }
 }
 
-export function rebuildArchiveIndex(): void {
+export function rebuildArchiveIndex(cwd: string): void {
 	try {
-		if (!existsSync(ARCHIVE_DIR)) return;
+		const archiveDir = questArchiveDir(cwd);
+		if (!existsSync(archiveDir)) return;
 		const entries: any[] = [];
-		const files = readdirSync(ARCHIVE_DIR)
+		const files = readdirSync(archiveDir)
 			.filter(f => f.endsWith(".json") && f !== "archive-index.json");
 		for (const f of files) {
 			try {
-				const raw = JSON.parse(readFileSync(join(ARCHIVE_DIR, f), "utf8"));
+				const raw = JSON.parse(readFileSync(join(archiveDir, f), "utf8"));
 				entries.push({
-					path: join(ARCHIVE_DIR, f),
+					path: join(archiveDir, f),
 					name: raw.name || f,
 					goal: raw.goal || "",
 					completedAt: raw.completedAt || null,
@@ -160,14 +162,16 @@ export function rebuildArchiveIndex(): void {
 			} catch (e) { console.error("[pi-quest] rebuildArchiveIndex/read:", e); /* skip corrupt */ }
 		}
 		entries.sort((a: any, b: any) => (b.completedAt || 0) - (a.completedAt || 0));
-		writeJSON(ARCHIVE_INDEX_PATH, { version: 1, entries });
+		writeJSON(questArchiveIndexPath(cwd), { version: 1, entries });
 	} catch (e) { console.error("[pi-quest] rebuildArchiveIndex:", e); /* best-effort */ }
 }
 
-export function listArchives(limit: number): { name: string; goal: string; tasks: number; done: number; completedAt: number | null }[] {
+export function listArchives(limit: number, cwd: string): { name: string; goal: string; tasks: number; done: number; completedAt: number | null }[] {
 	try {
-		if (!existsSync(ARCHIVE_DIR)) return [];
-		const index = readJSON<{ version: 1; entries: any[] } | null>(ARCHIVE_INDEX_PATH, null);
+		const archiveDir = questArchiveDir(cwd);
+		if (!existsSync(archiveDir)) return [];
+		const indexPath = questArchiveIndexPath(cwd);
+		const index = readJSON<{ version: 1; entries: any[] } | null>(indexPath, null);
 		if (index && Array.isArray(index.entries)) {
 			return index.entries.slice(0, limit).map((e: any) => ({
 				name: e.name || "?",
@@ -177,8 +181,8 @@ export function listArchives(limit: number): { name: string; goal: string; tasks
 				completedAt: e.completedAt || null,
 			}));
 		}
-		rebuildArchiveIndex();
-		const rebuilt = readJSON<{ version: 1; entries: any[] }>(ARCHIVE_INDEX_PATH, { version: 1, entries: [] });
+		rebuildArchiveIndex(cwd);
+		const rebuilt = readJSON<{ version: 1; entries: any[] }>(indexPath, { version: 1, entries: [] });
 		return rebuilt.entries.slice(0, limit).map((e: any) => ({
 			name: e.name || "?",
 			goal: e.goal || "",

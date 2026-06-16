@@ -25,8 +25,8 @@ export default function (pi: ExtensionAPI) {
 	let questCache: Quest | null = null;
 	let autoPilotLocked = false;
 
-	function getQuest(): Quest | null {
-		if (!questCache) questCache = loadQuest();
+	function getQuest(cwd?: string): Quest | null {
+		if (!questCache && cwd) questCache = loadQuest(cwd);
 		return questCache;
 	}
 
@@ -115,22 +115,21 @@ export default function (pi: ExtensionAPI) {
 			})),
 		}),
 		async execute(_id, params, _signal, _onUpdate, ctx) {
-			if (getQuest()?.status === "active") {
+			if (getQuest(ctx.cwd)?.status === "active") {
 				return {
 					content: [{ type: "text", text: "A quest is already active. Pause or complete it first with /quest pause." }],
 					details: {},
 				};
 			}
 
-			const existing = getQuest();
+			const existing = getQuest(ctx.cwd);
 			const overwriteWarning = existing && existing.status !== "active"
 				? `\n⚠ Replacing existing quest "${existing.name}" (status: ${existing.status}). Previous quest will be archived on completion.`
 				: "";
 
 			const quest = emptyQuest(params.name, params.goal, undefined, params.planningMode ?? "auto", params.verifyOnComplete ?? true, params.gitIntegration);
-			quest.cwd = ctx.cwd;
 			validateAndSetTeam(quest, params.team);
-			saveQuest(quest);
+			saveQuest(quest, ctx.cwd);
 			questCache = quest;
 			renderStatus(ctx, quest);
 			writeQuestSessionMeta(ctx.cwd, quest);
@@ -237,7 +236,7 @@ export default function (pi: ExtensionAPI) {
 			autoStart: Type.Optional(Type.Boolean({ description: "Start auto-pilot immediately after saving (default: true)", default: true })),
 		}),
 		async execute(_id, params, _signal, _onUpdate, ctx) {
-			const quest = getQuest();
+			const quest = getQuest(ctx.cwd);
 			if (!quest) {
 				return { content: [{ type: "text", text: "No active quest. Use quest_create first." }], details: {} };
 			}
@@ -326,7 +325,7 @@ export default function (pi: ExtensionAPI) {
 					quest.sameTaskCount = 0;
 					quest.pauseReason = null;
 
-					saveQuest(quest);
+					saveQuest(quest, ctx.cwd);
 					questCache = quest;
 					renderStatus(ctx, quest);
 					writeQuestSessionMeta(ctx.cwd, quest);
@@ -359,7 +358,7 @@ export default function (pi: ExtensionAPI) {
 				if (action === "Edit tasks before approving") {
 					quest.status = "planning";
 					quest.pauseReason = "Plan review: user wants edits. Use quest_approve(edits=[...]) to modify tasks and approve.";
-					saveQuest(quest);
+					saveQuest(quest, ctx.cwd);
 					questCache = quest;
 					renderStatus(ctx, quest);
 					writeQuestSessionMeta(ctx.cwd, quest);
@@ -386,7 +385,7 @@ export default function (pi: ExtensionAPI) {
 					quest.tasks = [];
 					quest.status = "planning";
 					quest.pauseReason = "User requested re-plan.";
-					saveQuest(quest);
+					saveQuest(quest, ctx.cwd);
 					questCache = quest;
 					renderStatus(ctx, quest);
 					writeQuestSessionMeta(ctx.cwd, quest);
@@ -408,7 +407,7 @@ export default function (pi: ExtensionAPI) {
 				// Cancel — keep plan for later
 				quest.status = "planning";
 				quest.pauseReason = "Plan saved, awaiting user approval. Use /quest approve or quest_approve to start.";
-				saveQuest(quest);
+				saveQuest(quest, ctx.cwd);
 				questCache = quest;
 				renderStatus(ctx, quest);
 				writeQuestSessionMeta(ctx.cwd, quest);
@@ -443,7 +442,7 @@ export default function (pi: ExtensionAPI) {
 				quest.status = "planning";
 			}
 
-			saveQuest(quest);
+			saveQuest(quest, ctx.cwd);
 			questCache = quest;
 			renderStatus(ctx, quest);
 			writeQuestSessionMeta(ctx.cwd, quest);
@@ -507,7 +506,7 @@ export default function (pi: ExtensionAPI) {
 			verifyEvidence: Type.Optional(Type.String({ description: "Evidence/details from the verifier for PASS or FAIL" })),
 		}),
 		async execute(_id, params, _signal, _onUpdate, ctx) {
-			const quest = getQuest();
+			const quest = getQuest(ctx.cwd);
 			if (!quest) {
 				return { content: [{ type: "text", text: "No active quest." }], details: {} };
 			}
@@ -533,7 +532,7 @@ export default function (pi: ExtensionAPI) {
 
 					quest.lastFiredTaskIndex = -1;
 					quest.sameTaskCount = 0;
-					saveQuest(quest);
+					saveQuest(quest, ctx.cwd);
 					questCache = quest;
 					renderStatus(ctx, quest);
 					writeQuestSessionMeta(ctx.cwd, quest);
@@ -578,7 +577,7 @@ export default function (pi: ExtensionAPI) {
 
 					quest.lastFiredTaskIndex = -1;
 					quest.sameTaskCount = 0;
-					saveQuest(quest);
+					saveQuest(quest, ctx.cwd);
 					questCache = quest;
 					renderStatus(ctx, quest);
 					writeQuestSessionMeta(ctx.cwd, quest);
@@ -606,7 +605,7 @@ export default function (pi: ExtensionAPI) {
 
 				quest.lastFiredTaskIndex = -1;
 				quest.sameTaskCount = 0;
-				saveQuest(quest);
+				saveQuest(quest, ctx.cwd);
 				questCache = quest;
 				renderStatus(ctx, quest);
 				writeQuestSessionMeta(ctx.cwd, quest);
@@ -636,7 +635,7 @@ export default function (pi: ExtensionAPI) {
 					task.verified = false;
 					task.verifyResult = null;
 
-					saveQuest(quest);
+					saveQuest(quest, ctx.cwd);
 					questCache = quest;
 					renderStatus(ctx, quest);
 					writeQuestSessionMeta(ctx.cwd, quest);
@@ -699,7 +698,7 @@ export default function (pi: ExtensionAPI) {
 			quest.lastFiredTaskIndex = -1;
 			quest.sameTaskCount = 0;
 
-			saveQuest(quest);
+			saveQuest(quest, ctx.cwd);
 			questCache = quest;
 			renderStatus(ctx, quest);
 			writeQuestSessionMeta(ctx.cwd, quest);
@@ -747,7 +746,7 @@ export default function (pi: ExtensionAPI) {
 			}), { description: "Optional task edits to apply before starting" })),
 		}),
 		async execute(_id, params, _signal, _onUpdate, ctx) {
-			const quest = getQuest();
+			const quest = getQuest(ctx.cwd);
 			if (!quest) {
 				return { content: [{ type: "text", text: "No active quest. Use quest_create first." }], details: {} };
 			}
@@ -803,7 +802,7 @@ export default function (pi: ExtensionAPI) {
 
 				const approved = await ctx.ui.confirm("Approve Quest Plan", confirmMsg);
 				if (!approved) {
-					saveQuest(quest);
+					saveQuest(quest, ctx.cwd);
 					questCache = quest;
 					renderStatus(ctx, quest);
 					writeQuestSessionMeta(ctx.cwd, quest);
@@ -830,7 +829,7 @@ export default function (pi: ExtensionAPI) {
 			quest.sameTaskCount = 0;
 			quest.pauseReason = null;
 
-			saveQuest(quest);
+			saveQuest(quest, ctx.cwd);
 			questCache = quest;
 			renderStatus(ctx, quest);
 			writeQuestSessionMeta(ctx.cwd, quest);
@@ -860,7 +859,7 @@ export default function (pi: ExtensionAPI) {
 		description: "Show the current quest, its tasks, and progress.",
 		parameters: Type.Object({}),
 		async execute(_id, _params, _signal, _onUpdate, ctx) {
-			const quest = getQuest();
+			const quest = getQuest(ctx.cwd);
 			if (!quest) {
 				return { content: [{ type: "text", text: "No active quest. Create one with quest_create or /quest create." }], details: {} };
 			}
@@ -885,7 +884,7 @@ export default function (pi: ExtensionAPI) {
 			branchName: Type.Optional(Type.String({ description: "Branch name where the commit was made" })),
 		}),
 		async execute(_id, params, _signal, _onUpdate, ctx) {
-			const quest = getQuest();
+			const quest = getQuest(ctx.cwd);
 			if (!quest) {
 				return { content: [{ type: "text", text: "No active quest. Use quest_create first." }], details: {} };
 			}
@@ -906,7 +905,7 @@ export default function (pi: ExtensionAPI) {
 				timestamp: Date.now(),
 			});
 
-			saveQuest(quest);
+			saveQuest(quest, ctx.cwd);
 			questCache = quest;
 			renderStatus(ctx, quest);
 			writeQuestSessionMeta(ctx.cwd, quest);
@@ -938,7 +937,7 @@ export default function (pi: ExtensionAPI) {
 		].join(" "),
 		parameters: Type.Object({}),
 		async execute(_id, _params, _signal, _onUpdate, _ctx) {
-			const quest = getQuest();
+			const quest = getQuest(ctx.cwd);
 			if (!quest) {
 				return { content: [{ type: "text", text: "No active quest." }], details: {} };
 			}
@@ -1042,7 +1041,7 @@ export default function (pi: ExtensionAPI) {
 			limit: Type.Optional(Type.Number({ description: "Number of past quests to show (default 5)", default: 5 })),
 		}),
 		async execute(_id, params, _signal, _onUpdate, _ctx) {
-			const archives = listArchives(params.limit ?? 5);
+			const archives = listArchives(params.limit ?? 5, ctx.cwd);
 			if (archives.length === 0) {
 				return { content: [{ type: "text", text: "No completed quests yet." }], details: { archives: [] } };
 			}
@@ -1067,7 +1066,7 @@ export default function (pi: ExtensionAPI) {
 			category: Type.Optional(Type.String({ description: "Optional category for grouping (e.g. \"security\", \"performance\", \"api\")" })),
 		}),
 		async execute(_id, params, _signal, _onUpdate, ctx) {
-			const quest = getQuest();
+			const quest = getQuest(ctx.cwd);
 			if (!quest) {
 				return { content: [{ type: "text", text: "No active quest. Use quest_create first." }], details: {} };
 			}
@@ -1089,7 +1088,7 @@ export default function (pi: ExtensionAPI) {
 				});
 			}
 
-			saveQuest(quest);
+			saveQuest(quest, ctx.cwd);
 			questCache = quest;
 			renderStatus(ctx, quest);
 			writeQuestSessionMeta(ctx.cwd, quest);
@@ -1130,7 +1129,7 @@ export default function (pi: ExtensionAPI) {
 		description: "Permanently archive the current quest and clear it. Only works when quest is not actively running (paused, planning, or done).",
 		parameters: Type.Object({}),
 		async execute(_id, _params, _signal, _onUpdate, ctx) {
-			const quest = getQuest();
+			const quest = getQuest(ctx.cwd);
 			if (!quest) {
 				return { content: [{ type: "text", text: "No active quest to abort." }], details: {} };
 			}
@@ -1143,7 +1142,7 @@ export default function (pi: ExtensionAPI) {
 			if (quest.status !== "done") {
 				quest.status = "done";
 				quest.completedAt = Date.now();
-				archiveQuest(quest);
+				archiveQuest(quest, ctx.cwd);
 			}
 			questCache = null;
 			renderStatus(ctx, null);
@@ -1163,7 +1162,7 @@ export default function (pi: ExtensionAPI) {
 			index: Type.Number({ description: "Task index (0-based)" }),
 		}),
 		async execute(_id, params, _signal, _onUpdate, _ctx) {
-			const quest = getQuest();
+			const quest = getQuest(ctx.cwd);
 			if (!quest) {
 				return { content: [{ type: "text", text: "No active quest." }], details: {} };
 			}
@@ -1207,7 +1206,7 @@ export default function (pi: ExtensionAPI) {
 	pi.on("agent_end", async (_event, ctx) => {
 		if (autoPilotLocked) return;
 		try {
-			const quest = getQuest();
+			const quest = getQuest(ctx.cwd);
 			if (!quest || quest.status !== "active") return;
 
 		const next = nextPendingTask(quest);
@@ -1259,7 +1258,7 @@ export default function (pi: ExtensionAPI) {
 								t.verifyResult = "[SKIP] Verification skipped by user.";
 								t.completedAt = Date.now();
 							}
-							saveQuest(quest);
+							saveQuest(quest, ctx.cwd);
 							questCache = quest;
 							renderStatus(ctx, quest);
 							writeQuestSessionMeta(ctx.cwd, quest);
@@ -1273,7 +1272,7 @@ export default function (pi: ExtensionAPI) {
 					quest.pauseReason = `Waiting for verification on ${verifyingTasks.length} task(s): ${verifyingTasks.map(t => t.content).join(", ")}. Resolve with quest_update(verifyOutcome=...).`;
 					quest.lastFiredTaskIndex = -1;
 					quest.sameTaskCount = 0;
-					saveQuest(quest);
+					saveQuest(quest, ctx.cwd);
 					questCache = quest;
 					renderStatus(ctx, quest);
 					writeQuestSessionMeta(ctx.cwd, quest);
@@ -1309,7 +1308,7 @@ export default function (pi: ExtensionAPI) {
 					quest.pauseReason = `Verification pending on ${verifyingTasks.length} task(s): ${verifyingTasks.map(t => t.content).join(", ")}. Complete verification to unblock dependent tasks.`;
 					quest.lastFiredTaskIndex = -1;
 					quest.sameTaskCount = 0;
-					saveQuest(quest);
+					saveQuest(quest, ctx.cwd);
 					questCache = quest;
 					renderStatus(ctx, quest);
 					writeQuestSessionMeta(ctx.cwd, quest);
@@ -1328,8 +1327,8 @@ export default function (pi: ExtensionAPI) {
 				quest.status = "done";
 				quest.completedAt = Date.now();
 				syncConventionsToMemory(quest, ctx.cwd);
-				archiveQuest(quest);
-				saveQuest(quest);
+				archiveQuest(quest, ctx.cwd);
+				saveQuest(quest, ctx.cwd);
 				questCache = quest;
 				renderStatus(ctx, quest);
 				writeQuestSessionMeta(ctx.cwd, quest);
@@ -1395,7 +1394,7 @@ export default function (pi: ExtensionAPI) {
 						quest.lastFiredTaskIndex = -1;
 						quest.sameTaskCount = 0;
 						quest.pauseReason = null;
-						saveQuest(quest);
+						saveQuest(quest, ctx.cwd);
 						questCache = quest;
 						renderStatus(ctx, quest);
 						writeQuestSessionMeta(ctx.cwd, quest);
@@ -1415,7 +1414,7 @@ export default function (pi: ExtensionAPI) {
 						quest.lastFiredTaskIndex = -1;
 						quest.sameTaskCount = 0;
 						quest.pauseReason = null;
-						saveQuest(quest);
+						saveQuest(quest, ctx.cwd);
 						questCache = quest;
 						renderStatus(ctx, quest);
 						writeQuestSessionMeta(ctx.cwd, quest);
@@ -1429,7 +1428,7 @@ export default function (pi: ExtensionAPI) {
 				quest.pauseReason = "Some tasks failed. Review and decide: retry, skip, or redefine.";
 				quest.lastFiredTaskIndex = -1;
 				quest.sameTaskCount = 0;
-				saveQuest(quest);
+				saveQuest(quest, ctx.cwd);
 				questCache = quest;
 				renderStatus(ctx, quest);
 				writeQuestSessionMeta(ctx.cwd, quest);
@@ -1458,7 +1457,7 @@ export default function (pi: ExtensionAPI) {
 			} else {
 				quest.status = "paused";
 				quest.pauseReason = "All remaining tasks are blocked by unfinished dependencies.";
-				saveQuest(quest);
+				saveQuest(quest, ctx.cwd);
 				questCache = quest;
 				renderStatus(ctx, quest);
 				writeQuestSessionMeta(ctx.cwd, quest);
@@ -1483,7 +1482,7 @@ export default function (pi: ExtensionAPI) {
 						next.task.completedAt = Date.now();
 						quest.lastFiredTaskIndex = -1;
 						quest.sameTaskCount = 0;
-						saveQuest(quest);
+						saveQuest(quest, ctx.cwd);
 						questCache = quest;
 						renderStatus(ctx, quest);
 						writeQuestSessionMeta(ctx.cwd, quest);
@@ -1498,7 +1497,7 @@ export default function (pi: ExtensionAPI) {
 						next.task.completedAt = Date.now();
 						quest.lastFiredTaskIndex = -1;
 						quest.sameTaskCount = 0;
-						saveQuest(quest);
+						saveQuest(quest, ctx.cwd);
 						questCache = quest;
 						renderStatus(ctx, quest);
 						writeQuestSessionMeta(ctx.cwd, quest);
@@ -1512,7 +1511,7 @@ export default function (pi: ExtensionAPI) {
 				quest.pauseReason = `Task #${next.index + 1} stalled (${quest.sameTaskCount} attempts without progress).`;
 				quest.lastFiredTaskIndex = -1;
 				quest.sameTaskCount = 0;
-				saveQuest(quest);
+				saveQuest(quest, ctx.cwd);
 				questCache = quest;
 				renderStatus(ctx, quest);
 				writeQuestSessionMeta(ctx.cwd, quest);
@@ -1542,7 +1541,7 @@ export default function (pi: ExtensionAPI) {
 			next.task.result = `Auto-failed after ${MAX_RETRIES + 1} attempts.`;
 			quest.lastFiredTaskIndex = -1;
 			quest.sameTaskCount = 0;
-			saveQuest(quest);
+			saveQuest(quest, ctx.cwd);
 			questCache = quest;
 			renderStatus(ctx, quest);
 			writeQuestSessionMeta(ctx.cwd, quest);
@@ -1570,7 +1569,7 @@ export default function (pi: ExtensionAPI) {
 					quest.tasksSincePause = 0;
 					quest.lastFiredTaskIndex = -1;
 					quest.sameTaskCount = 0;
-					saveQuest(quest);
+					saveQuest(quest, ctx.cwd);
 					questCache = quest;
 					renderStatus(ctx, quest);
 					writeQuestSessionMeta(ctx.cwd, quest);
@@ -1580,7 +1579,7 @@ export default function (pi: ExtensionAPI) {
 					quest.pauseReason = `User paused at checkpoint after ${quest.tasksSincePause} tasks. /quest resume to continue.`;
 					quest.lastFiredTaskIndex = -1;
 					quest.sameTaskCount = 0;
-					saveQuest(quest);
+					saveQuest(quest, ctx.cwd);
 					questCache = quest;
 					renderStatus(ctx, quest);
 					writeQuestSessionMeta(ctx.cwd, quest);
@@ -1593,7 +1592,7 @@ export default function (pi: ExtensionAPI) {
 				quest.pauseReason = `Auto-paused after ${MAX_BURST} tasks. /quest resume to continue.`;
 				quest.lastFiredTaskIndex = -1;
 				quest.sameTaskCount = 0;
-				saveQuest(quest);
+				saveQuest(quest, ctx.cwd);
 				questCache = quest;
 				renderStatus(ctx, quest);
 				writeQuestSessionMeta(ctx.cwd, quest);
@@ -1618,7 +1617,7 @@ export default function (pi: ExtensionAPI) {
 		if (!next.task.startedAt) next.task.startedAt = Date.now();
 		quest.lastFiredTaskIndex = next.index;
 		quest.tasksSincePause++;
-		saveQuest(quest);
+		saveQuest(quest, ctx.cwd);
 		questCache = quest;
 		renderStatus(ctx, quest);
 		writeQuestSessionMeta(ctx.cwd, quest);
@@ -1635,11 +1634,11 @@ export default function (pi: ExtensionAPI) {
 		}
 		} catch (e) {
 			console.error("[pi-quest] agent_end handler crashed:", e);
-			const quest = getQuest();
+			const quest = getQuest(ctx.cwd);
 			if (quest) {
 				quest.status = "paused";
 				quest.pauseReason = `Auto-pilot error: ${(e as Error)?.message || String(e)}`;
-				saveQuest(quest);
+				saveQuest(quest, ctx.cwd);
 				questCache = quest;
 			}
 			renderStatus(ctx, quest);
@@ -1654,7 +1653,7 @@ export default function (pi: ExtensionAPI) {
 	// ── Lifecycle ─────────────────────────────────────────────────────────────
 
 	pi.on("session_start", async (_event, ctx) => {
-		questCache = loadQuest();
+		questCache = loadQuest(ctx.cwd);
 		renderStatus(ctx, questCache);
 		writeQuestSessionMeta(ctx.cwd, questCache);
 		if (questCache?.status === "active") syncQuestToTodo(questCache, ctx.cwd);
@@ -1705,7 +1704,7 @@ export default function (pi: ExtensionAPI) {
 
 			switch (sub) {
 				case "": {
-					const quest = loadQuest();
+					const quest = loadQuest(ctx.cwd);
 					if (!quest) {
 						ctx.ui.notify("No active quest. Use /quest create <name>: <goal> to start.", "info");
 						return;
@@ -1716,7 +1715,7 @@ export default function (pi: ExtensionAPI) {
 							kanban.onClose = () => done(undefined);
 							return {
 								render: (w: number) => {
-									const fresh = loadQuest();
+									const fresh = loadQuest(ctx.cwd);
 									if (fresh) kanban.setQuest(fresh);
 									return kanban.render(w);
 								},
@@ -1739,14 +1738,13 @@ export default function (pi: ExtensionAPI) {
 						return;
 					}
 
-					if (getQuest()?.status === "active") {
+					if (getQuest(ctx.cwd)?.status === "active") {
 						ctx.ui.notify("A quest is already active. /quest pause first.", "error");
 						return;
 					}
 
 					const quest = emptyQuest(name, goal || name);
-					quest.cwd = ctx.cwd;
-					saveQuest(quest);
+					saveQuest(quest, ctx.cwd);
 					questCache = quest;
 					renderStatus(ctx, quest);
 					writeQuestSessionMeta(ctx.cwd, quest);
@@ -1862,7 +1860,7 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 				case "start": {
-					const quest = getQuest();
+					const quest = getQuest(ctx.cwd);
 					if (!quest) {
 						ctx.ui.notify("No quest created. /quest create first.", "error");
 						return;
@@ -1887,7 +1885,7 @@ export default function (pi: ExtensionAPI) {
 					quest.lastFiredTaskIndex = -1;
 					quest.sameTaskCount = 0;
 					quest.pauseReason = null;
-					saveQuest(quest);
+					saveQuest(quest, ctx.cwd);
 					questCache = quest;
 					renderStatus(ctx, quest);
 					writeQuestSessionMeta(ctx.cwd, quest);
@@ -1897,7 +1895,7 @@ export default function (pi: ExtensionAPI) {
 					return;
 				}
 				case "pause": {
-					const quest = getQuest();
+					const quest = getQuest(ctx.cwd);
 					if (!quest || quest.status !== "active") {
 						ctx.ui.notify("No active quest to pause.", "info");
 						return;
@@ -1906,7 +1904,7 @@ export default function (pi: ExtensionAPI) {
 					quest.pauseReason = "Paused by user.";
 					quest.lastFiredTaskIndex = -1;
 					quest.sameTaskCount = 0;
-					saveQuest(quest);
+					saveQuest(quest, ctx.cwd);
 					questCache = quest;
 					renderStatus(ctx, quest);
 					writeQuestSessionMeta(ctx.cwd, quest);
@@ -1915,7 +1913,7 @@ export default function (pi: ExtensionAPI) {
 					return;
 				}
 				case "resume": {
-					const quest = getQuest();
+					const quest = getQuest(ctx.cwd);
 					if (!quest || quest.status !== "paused") {
 						ctx.ui.notify("No paused quest to resume.", "info");
 						return;
@@ -1925,7 +1923,7 @@ export default function (pi: ExtensionAPI) {
 					quest.lastFiredTaskIndex = -1;
 					quest.sameTaskCount = 0;
 					quest.pauseReason = null;
-					saveQuest(quest);
+					saveQuest(quest, ctx.cwd);
 					questCache = quest;
 					renderStatus(ctx, quest);
 					writeQuestSessionMeta(ctx.cwd, quest);
@@ -1940,7 +1938,7 @@ export default function (pi: ExtensionAPI) {
 					return;
 				}
 				case "approve": {
-					const quest = getQuest();
+					const quest = getQuest(ctx.cwd);
 					if (!quest) {
 						ctx.ui.notify("No quest created. /quest create first.", "error");
 						return;
@@ -1963,7 +1961,7 @@ export default function (pi: ExtensionAPI) {
 					quest.lastFiredTaskIndex = -1;
 					quest.sameTaskCount = 0;
 					quest.pauseReason = null;
-					saveQuest(quest);
+					saveQuest(quest, ctx.cwd);
 					questCache = quest;
 					renderStatus(ctx, quest);
 					writeQuestSessionMeta(ctx.cwd, quest);
@@ -1977,7 +1975,7 @@ export default function (pi: ExtensionAPI) {
 					return;
 				}
 			case "kanban": {
-				const quest = loadQuest();
+				const quest = loadQuest(ctx.cwd);
 				if (!quest) {
 					ctx.ui.notify("No active quest.", "info");
 					return;
@@ -1989,7 +1987,7 @@ export default function (pi: ExtensionAPI) {
 						// Refresh quest data on re-render so status updates are visible
 						return {
 							render: (w: number) => {
-								const fresh = loadQuest();
+								const fresh = loadQuest(ctx.cwd);
 								if (fresh) kanban.setQuest(fresh);
 								return kanban.render(w);
 							},
@@ -2003,7 +2001,7 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 			case "status": {
-					const quest = loadQuest();
+					const quest = loadQuest(ctx.cwd);
 					if (!quest) {
 						ctx.ui.notify("No active quest.", "info");
 						return;
@@ -2012,7 +2010,7 @@ export default function (pi: ExtensionAPI) {
 					return;
 				}
 				case "git": {
-				const quest = getQuest();
+				const quest = getQuest(ctx.cwd);
 				if (!quest) {
 					ctx.ui.notify("No active quest.", "info");
 					return;
@@ -2044,7 +2042,7 @@ export default function (pi: ExtensionAPI) {
 			}
 			case "history": {
 					const limit = parseInt(rest, 10) || 10;
-					const archives = listArchives(limit);
+					const archives = listArchives(limit, ctx.cwd);
 					if (archives.length === 0) {
 						ctx.ui.notify("No completed quests yet.", "info");
 						return;
@@ -2057,7 +2055,7 @@ export default function (pi: ExtensionAPI) {
 					return;
 				}
 				case "cancel": {
-					const quest = getQuest();
+					const quest = getQuest(ctx.cwd);
 					if (!quest) {
 						ctx.ui.notify("No active quest to cancel.", "info");
 						return;
@@ -2071,7 +2069,7 @@ export default function (pi: ExtensionAPI) {
 					if (quest.status !== "done") {
 						quest.status = "done";
 						quest.completedAt = Date.now();
-						archiveQuest(quest);
+						archiveQuest(quest, ctx.cwd);
 					}
 					questCache = null;
 					renderStatus(ctx, null);

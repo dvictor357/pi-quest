@@ -30,7 +30,6 @@ export interface Quest {
 	name: string;
 	goal: string;
 	status: QuestStatus;
-	cwd?: string;
 	tasks: QuestTask[];
 	tasksSincePause: number;
 	lastFiredTaskIndex: number;
