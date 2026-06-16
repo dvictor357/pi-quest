@@ -1,0 +1,78 @@
+import { homedir } from "node:os";
+import { join } from "node:path";
+import type { TaskStatus, TeamConfig } from "./types";
+
+export const MAX_BURST = 6;
+export const MAX_RETRIES = 2;
+export const MAX_VERIFY_RETRIES = 2;
+export const MAX_DEPENDENCY_DEPTH = 3;
+
+export const AGENT_DIR = join(homedir(), ".pi", "agent");
+export const ACTIVE_PATH = join(AGENT_DIR, "quests", "active.json");
+export const ARCHIVE_DIR = join(AGENT_DIR, "quests", "archive");
+export const MEMORY_PROJECTS_DIR = join(AGENT_DIR, "memory", "projects");
+export const SESSION_META_PATH = join(AGENT_DIR, "session-meta.json");
+export const ARCHIVE_INDEX_PATH = join(ARCHIVE_DIR, "archive-index.json");
+export const TEAMS_DIR = join(AGENT_DIR, "quests", "teams");
+
+export const ICON: Record<TaskStatus, string> = {
+	pending: "☐",
+	running: "▶",
+	verifying: "🔍",
+	done: "☑",
+	failed: "✗",
+	skipped: "⏭",
+};
+
+export const BUILT_IN_TEAMS: Record<string, TeamConfig> = {
+	engineering: {
+		name: "engineering",
+		description: "Balanced team for feature development with code review and testing",
+		lead: "worker",
+		members: [
+			{ role: "developer", agent: "worker" },
+			{ role: "reviewer", agent: "reviewer" },
+			{ role: "tester", agent: "verifier" },
+		],
+		defaultAgent: "worker",
+		verification: true,
+	},
+	research: {
+		name: "research",
+		description: "Exploration-first team with scout, planner, and worker support",
+		lead: "scout",
+		members: [
+			{ role: "explorer", agent: "scout" },
+			{ role: "planner", agent: "planner" },
+			{ role: "implementer", agent: "worker" },
+			{ role: "reviewer", agent: "reviewer" },
+		],
+		defaultAgent: "scout",
+		verification: true,
+	},
+	content: {
+		name: "content",
+		description: "Content creation team with writer, editor, and reviewer roles",
+		lead: "worker",
+		members: [
+			{ role: "writer", agent: "worker" },
+			{ role: "editor", agent: "reviewer" },
+			{ role: "fact-checker", agent: "scout" },
+		],
+		defaultAgent: "worker",
+		verification: true,
+	},
+	devops: {
+		name: "devops",
+		description: "Infrastructure and deployment team with CI/CD, cloud, and security roles",
+		lead: "worker",
+		members: [
+			{ role: "infra", agent: "worker" },
+			{ role: "security", agent: "reviewer" },
+			{ role: "monitoring", agent: "scout" },
+			{ role: "release", agent: "verifier" },
+		],
+		defaultAgent: "worker",
+		verification: true,
+	},
+};

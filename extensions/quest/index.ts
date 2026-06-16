@@ -1,957 +1,42 @@
 /**
- * quest.ts — proactive AI project manager for pi
+ * quest/index.ts — proactive AI project manager for pi
  *
- * Quest is the orchestrator that sits above sub-agents, pi-todo, and
- * pi-memory. Give it a goal and it plans, delegates, verifies, and pushes
- * forward autonomously until the job is done — no hand-holding needed.
- *
- * ┌─────────────────────────────────────────────┐
- * │              QUEST ORCHESTRATOR              │
- * │                                             │
- * │  1. Scout explores → 2. Planner plans       │
- * │  3. Auto-pilot fires tasks one by one        │
- * │  4. Main agent + sub-agents execute          │
- * │  5. Verifier checks → 6. All done!           │
- * │                                             │
- * │  Safety: max burst, stall detection, retries │
- * └─────────────────────────────────────────────┘
- *
- * Storage: ~/.pi/agent/quests/active.json + archive/
- *
- * Integration:
- *   • Syncs tasks to pi-todo for status bar visibility
- *   • Saves project conventions to pi-memory on completion
- *   • Uses subagent spawner for isolated work
+ * Entry point for the quest extension. Imports all modules and registers
+ * tools, commands, and event handlers.
  */
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { StringEnum } from "@earendil-works/pi-ai";
-import { matchesKey, Key, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync, rmSync } from "node:fs";
+import { join } from "node:path";
 import { homedir } from "node:os";
-import { basename, dirname, join } from "node:path";
-import { execSync } from "node:child_process";
 
-// ── Types ────────────────────────────────────────────────────────────────────
-
-type QuestStatus = "planning" | "active" | "paused" | "done" | "idle";
-type TaskStatus = "pending" | "running" | "verifying" | "done" | "failed" | "skipped";
-
-interface QuestTask {
-	content: string;
-	status: TaskStatus;
-	agent: string;
-	context: string;
-	dependencies: number[];
-	result: string | null;
-	attempts: number;
-	startedAt: number | null;
-	completedAt: number | null;
-	verified: boolean;
-	verifyResult: string | null;
-	verifyRetries: number;
-	commitHash: string | null;
-	branchName: string | null;
-}
-
-interface GitIntegration {
-	autoCommit: boolean;
-	autoBranch: boolean;
-	autoPR: boolean;
-	branchPrefix: string;
-}
-
-interface Quest {
-	version: 1;
-	name: string;
-	goal: string;
-	status: QuestStatus;
-	tasks: QuestTask[];
-	tasksSincePause: number;
-	lastFiredTaskIndex: number;
-	sameTaskCount: number;
-	pauseReason: string | null;
-	conventions: string[];
-	team?: string;
-	planningMode: "auto" | "approve";
-	planApproved: boolean;
-	verifyOnComplete: boolean;
-	gitIntegration?: GitIntegration;
-	commits: { taskIndex: number; hash: string; message: string; branch?: string; timestamp: number }[];
-	researchFindings?: { key: string; value: string; category?: string; timestamp: number }[];
-	createdAt: number;
-	completedAt: number | null;
-	updatedAt: number;
-}
-
-interface TeamConfig {
-	name: string;
-	description: string;
-	lead: string;
-	members: { role: string; agent: string }[];
-	defaultAgent: string;
-	verification: boolean;
-	agents?: { name: string; description: string; markdown: string }[];
-}
-
-const MAX_BURST = 6; // auto-pause after this many consecutive tasks
-const MAX_RETRIES = 2; // per task, before marking failed
-const MAX_VERIFY_RETRIES = 2; // verification retries before marking task failed
-const MAX_DEPENDENCY_DEPTH = 3; // sanity check
-const AGENT_DIR = join(homedir(), ".pi", "agent");
-const ACTIVE_PATH = join(AGENT_DIR, "quests", "active.json");
-const ARCHIVE_DIR = join(AGENT_DIR, "quests", "archive");
-const MEMORY_PROJECTS_DIR = join(AGENT_DIR, "memory", "projects");
-const SESSION_META_PATH = join(AGENT_DIR, "session-meta.json");
-
-const ICON: Record<TaskStatus, string> = {
-	pending: "☐",
-	running: "▶",
-	verifying: "🔍",
-	done: "☑",
-	failed: "✗",
-	skipped: "⏭",
-};
-
-const TEAMS_DIR = join(AGENT_DIR, "quests", "teams");
-
-const BUILT_IN_TEAMS: Record<string, TeamConfig> = {
-	engineering: {
-		name: "engineering",
-		description: "Balanced team for feature development with code review and testing",
-		lead: "worker",
-		members: [
-			{ role: "developer", agent: "worker" },
-			{ role: "reviewer", agent: "reviewer" },
-			{ role: "tester", agent: "verifier" },
-		],
-		defaultAgent: "worker",
-		verification: true,
-	},
-	research: {
-		name: "research",
-		description: "Exploration-first team with scout, planner, and worker support",
-		lead: "scout",
-		members: [
-			{ role: "explorer", agent: "scout" },
-			{ role: "planner", agent: "planner" },
-			{ role: "implementer", agent: "worker" },
-			{ role: "reviewer", agent: "reviewer" },
-		],
-		defaultAgent: "scout",
-		verification: true,
-	},
-	content: {
-		name: "content",
-		description: "Content creation team with writer, editor, and reviewer roles",
-		lead: "worker",
-		members: [
-			{ role: "writer", agent: "worker" },
-			{ role: "editor", agent: "reviewer" },
-			{ role: "fact-checker", agent: "scout" },
-		],
-		defaultAgent: "worker",
-		verification: true,
-	},
-	devops: {
-		name: "devops",
-		description: "Infrastructure and deployment team with CI/CD, cloud, and security roles",
-		lead: "worker",
-		members: [
-			{ role: "infra", agent: "worker" },
-			{ role: "security", agent: "reviewer" },
-			{ role: "monitoring", agent: "scout" },
-			{ role: "release", agent: "verifier" },
-		],
-		defaultAgent: "worker",
-		verification: true,
-	},
-};
-
-// ── Storage ──────────────────────────────────────────────────────────────────
-
-function cwdHash(cwd: string): string {
-	return createHash("sha256").update(cwd).digest("hex").slice(0, 16);
-}
-
-function readJSON<T>(path: string, fallback: T): T {
-	try {
-		if (existsSync(path)) return JSON.parse(readFileSync(path, "utf8"));
-	} catch { /* corrupt → fallback */ }
-	return fallback;
-}
-
-function writeJSON(path: string, data: unknown): void {
-	try {
-		mkdirSync(dirname(path), { recursive: true });
-		writeFileSync(path, `${JSON.stringify(data, null, 2)}\n`, "utf8");
-	} catch { /* best-effort */ }
-}
-
-function writeSessionMeta(key: "memory" | "todo" | "quest", cwd: string, data: Record<string, unknown>): void {
-	try {
-		const existing = readJSON<{ cwd?: string; cwdHash?: string; updatedAt?: number; extensions?: Record<string, unknown> }>(SESSION_META_PATH, { extensions: {} });
-		const next = {
-			...existing,
-			cwd,
-			cwdHash: cwdHash(cwd),
-			updatedAt: Date.now(),
-			extensions: {
-				...(existing.extensions ?? {}),
-				[key]: { ...data, updatedAt: Date.now() },
-			},
-		};
-		writeJSON(SESSION_META_PATH, next);
-	} catch { /* best-effort cross-extension metadata */ }
-}
-
-function projectMemoryPath(cwd: string): string {
-	return join(MEMORY_PROJECTS_DIR, `${cwdHash(cwd)}.json`);
-}
-
-function loadProjectMemory(cwd: string): Record<string, any> | null {
-	return readJSON<Record<string, any> | null>(projectMemoryPath(cwd), null);
-}
-
-function syncConventionsToMemory(quest: Quest, cwd: string): void {
-	try {
-		if (!quest.conventions.length) return;
-		const existing = loadProjectMemory(cwd) ?? {
-			name: basename(cwd),
-			conventions: [],
-			lastScanned: 0,
-		};
-		const conventions = Array.isArray(existing.conventions) ? existing.conventions : [];
-		const merged = [...new Set([...conventions, ...quest.conventions])];
-		writeJSON(projectMemoryPath(cwd), { ...existing, conventions: merged, lastModified: Date.now() });
-	} catch { /* optional — pi-memory may not be installed */ }
-}
-
-function emptyQuest(name: string, goal: string, team?: string, planningMode: "auto" | "approve" = "auto", verifyOnComplete = true, gitIntegration?: GitIntegration): Quest {
-	const quest: Quest = {
-		version: 1,
-		name,
-		goal,
-		status: "planning",
-		tasks: [],
-		tasksSincePause: 0,
-		lastFiredTaskIndex: -1,
-		sameTaskCount: 0,
-		pauseReason: null,
-		conventions: [],
-		commits: [],
-		planningMode,
-		planApproved: false,
-		verifyOnComplete,
-		gitIntegration: gitIntegration ?? { autoCommit: true, autoBranch: true, autoPR: false, branchPrefix: "quest/" },
-		createdAt: Date.now(),
-		completedAt: null,
-		updatedAt: Date.now(),
-	};
-	if (team) {
-		ensureBuiltInTeams();
-		const config = loadTeams()[team];
-		if (config) {
-			quest.team = team;
-		}
-	}
-	return quest;
-}
-
-function loadQuest(): Quest | null {
-	try {
-		if (!existsSync(ACTIVE_PATH)) return null;
-		const raw = JSON.parse(readFileSync(ACTIVE_PATH, "utf8"));
-		if (raw && raw.version === 1 && Array.isArray(raw.tasks)) {
-			// Coerce task fields for safety
-			raw.tasks = raw.tasks.map((t: any) => ({
-				content: t.content || "",
-				status: t.status || "pending",
-				agent: t.agent || "worker",
-				context: t.context || "",
-				dependencies: Array.isArray(t.dependencies) ? t.dependencies : [],
-				result: t.result || null,
-				attempts: t.attempts || 0,
-				completedAt: t.completedAt || null,
-				verified: typeof t.verified === "boolean" ? t.verified : false,
-				verifyResult: t.verifyResult || null,
-				verifyRetries: typeof t.verifyRetries === "number" ? t.verifyRetries : 0,
-				commitHash: t.commitHash || null,
-				branchName: t.branchName || null,
-				startedAt: typeof t.startedAt === "number" ? t.startedAt : null,
-			}));
-			// Coerce new fields for backward compatibility
-			if (raw.planningMode !== "auto" && raw.planningMode !== "approve") {
-				raw.planningMode = "auto";
-			}
-			if (typeof raw.planApproved !== "boolean") {
-				raw.planApproved = false;
-			}
-			if (typeof raw.verifyOnComplete !== "boolean") {
-				raw.verifyOnComplete = false;
-			}
-			if (!raw.commits || !Array.isArray(raw.commits)) {
-				raw.commits = [];
-			}
-			return raw as Quest;
-		}
-	} catch { /* corrupt */ }
-	return null;
-}
-
-function saveQuest(quest: Quest): void {
-	quest.updatedAt = Date.now();
-	writeJSON(ACTIVE_PATH, quest);
-}
-
-function archiveQuest(quest: Quest): string | null {
-	try {
-		const slug = quest.name.replace(/[^a-z0-9-]+/gi, "-").toLowerCase();
-		const ts = quest.completedAt ?? Date.now();
-		const path = join(ARCHIVE_DIR, `${ts}-${slug}.json`);
-		writeJSON(path, quest);
-		updateArchiveIndex({
-			path,
-			name: quest.name,
-			goal: quest.goal,
-			completedAt: quest.completedAt ?? Date.now(),
-			taskCount: quest.tasks.length,
-			doneCount: quest.tasks.filter(t => t.status === "done").length,
-		});
-		return path;
-	} catch { return null; }
-}
-
-const ARCHIVE_INDEX_PATH = join(ARCHIVE_DIR, "archive-index.json");
-
-function updateArchiveIndex(entry: { path: string; name: string; goal: string; completedAt: number; taskCount: number; doneCount: number }): void {
-	try {
-		const index = readJSON<{ version: 1; entries: any[] }>(ARCHIVE_INDEX_PATH, { version: 1, entries: [] });
-		index.entries = index.entries.filter((e: any) => e.path !== entry.path);
-		index.entries.push(entry);
-		index.entries.sort((a: any, b: any) => (b.completedAt || 0) - (a.completedAt || 0));
-		writeJSON(ARCHIVE_INDEX_PATH, index);
-	} catch { /* best-effort */ }
-}
-
-function rebuildArchiveIndex(): void {
-	try {
-		if (!existsSync(ARCHIVE_DIR)) return;
-		const entries: any[] = [];
-		const files = readdirSync(ARCHIVE_DIR)
-			.filter(f => f.endsWith(".json") && f !== "archive-index.json");
-		for (const f of files) {
-			try {
-				const raw = JSON.parse(readFileSync(join(ARCHIVE_DIR, f), "utf8"));
-				entries.push({
-					path: join(ARCHIVE_DIR, f),
-					name: raw.name || f,
-					goal: raw.goal || "",
-					completedAt: raw.completedAt || null,
-					taskCount: Array.isArray(raw.tasks) ? raw.tasks.length : 0,
-					doneCount: Array.isArray(raw.tasks) ? raw.tasks.filter((t: any) => t.status === "done").length : 0,
-				});
-			} catch { /* skip corrupt */ }
-		}
-		entries.sort((a: any, b: any) => (b.completedAt || 0) - (a.completedAt || 0));
-		writeJSON(ARCHIVE_INDEX_PATH, { version: 1, entries });
-	} catch { /* best-effort */ }
-}
-
-// ── Team config helpers ──────────────────────────────────────────────────────
-
-function loadTeams(): Record<string, TeamConfig> {
-	try {
-		if (!existsSync(TEAMS_DIR)) return {};
-		const teams: Record<string, TeamConfig> = {};
-		for (const f of readdirSync(TEAMS_DIR)) {
-			if (!f.endsWith(".json")) continue;
-			try {
-				const raw = JSON.parse(readFileSync(join(TEAMS_DIR, f), "utf8"));
-				if (raw && raw.name) {
-					teams[raw.name] = raw as TeamConfig;
-				}
-			} catch { /* skip corrupt files */ }
-		}
-		return teams;
-	} catch { return {}; }
-}
-
-function saveTeam(team: TeamConfig): void {
-	try {
-		mkdirSync(TEAMS_DIR, { recursive: true });
-		writeFileSync(join(TEAMS_DIR, `${team.name}.json`), `${JSON.stringify(team, null, 2)}\n`, "utf8");
-	} catch { /* best-effort */ }
-}
-
-function ensureBuiltInTeams(): void {
-	try {
-		const existing = loadTeams();
-		for (const key of Object.keys(BUILT_IN_TEAMS)) {
-			if (!existing[key]) {
-				saveTeam(BUILT_IN_TEAMS[key]);
-			}
-		}
-	} catch { /* best-effort */ }
-}
-
-function teamInstallFromGit(url: string): { success: boolean; team?: TeamConfig; error?: string } {
-	const tmpDir = join(homedir(), ".pi", "agent", "quests", "teams", ".tmp");
-	try {
-		// Clean up any previous temp
-		try { rmSync(tmpDir, { recursive: true, force: true }); } catch { /* ok */ }
-
-		// Clone the repo
-		const cloneOutput = execSync(`git clone --depth 1 "${url}" "${tmpDir}"`, {
-			encoding: "utf8",
-			timeout: 30000,
-			stdio: ["pipe", "pipe", "pipe"],
-		});
-
-		// Look for team.json or quest-team.json in the root
-		const candidates = ["team.json", "quest-team.json", "quest.team.json"];
-		let raw: any = null;
-		for (const c of candidates) {
-			const p = join(tmpDir, c);
-			if (existsSync(p)) {
-				raw = JSON.parse(readFileSync(p, "utf8"));
-				break;
-			}
-		}
-
-		if (!raw) {
-			return { success: false, error: `No team.json, quest-team.json, or quest.team.json found in repository root.` };
-		}
-
-		// Validate required fields
-		if (!raw.name || !raw.description || !Array.isArray(raw.members)) {
-			return { success: false, error: "Team config must have name, description, and members array." };
-		}
-
-		const team: TeamConfig = {
-			name: raw.name,
-			description: raw.description,
-			lead: raw.lead || raw.members[0]?.agent || "worker",
-			members: raw.members.map((m: any) => ({
-				role: m.role || m.agent || "member",
-				agent: m.agent || "worker",
-			})),
-			defaultAgent: raw.defaultAgent || raw.members[0]?.agent || "worker",
-			verification: typeof raw.verification === "boolean" ? raw.verification : true,
-		};
-
-		// Handle custom agent markdown files
-		if (Array.isArray(raw.agents)) {
-			team.agents = raw.agents.map((a: any) => ({
-				name: a.name || "",
-				description: a.description || "",
-				markdown: a.markdown || a.file ? (() => {
-					const mdPath = join(tmpDir, a.file || `${a.name}.md`);
-					try { return readFileSync(mdPath, "utf8"); } catch { return a.markdown || ""; }
-				})() : "",
-			}));
-		}
-
-		// Install custom agent markdown files to agent config dir
-		if (team.agents && team.agents.length > 0) {
-			const agentsDir = join(homedir(), ".pi", "agent", "agents");
-			mkdirSync(agentsDir, { recursive: true });
-			for (const agent of team.agents) {
-				if (agent.markdown) {
-					writeFileSync(join(agentsDir, `${agent.name}.md`), agent.markdown, "utf8");
-				}
-			}
-		}
-
-		// Save the team
-		saveTeam(team);
-
-		return { success: true, team };
-	} catch (e: any) {
-		return { success: false, error: e?.message || String(e) };
-	} finally {
-		try { rmSync(tmpDir, { recursive: true, force: true }); } catch { /* cleanup */ }
-	}
-}
-
-function listArchives(limit: number): { name: string; goal: string; tasks: number; done: number; completedAt: number | null }[] {
-	try {
-		if (!existsSync(ARCHIVE_DIR)) return [];
-		// Try index first
-		const index = readJSON<{ version: 1; entries: any[] } | null>(ARCHIVE_INDEX_PATH, null);
-		if (index && Array.isArray(index.entries)) {
-			return index.entries.slice(0, limit).map((e: any) => ({
-				name: e.name || "?",
-				goal: e.goal || "",
-				tasks: e.taskCount || 0,
-				done: e.doneCount || 0,
-				completedAt: e.completedAt || null,
-			}));
-		}
-		// Fallback: rebuild index from archive files
-		rebuildArchiveIndex();
-		const rebuilt = readJSON<{ version: 1; entries: any[] }>(ARCHIVE_INDEX_PATH, { version: 1, entries: [] });
-		return rebuilt.entries.slice(0, limit).map((e: any) => ({
-			name: e.name || "?",
-			goal: e.goal || "",
-			tasks: e.taskCount || 0,
-			done: e.doneCount || 0,
-			completedAt: e.completedAt || null,
-		}));
-	} catch { return []; }
-}
-
-// ── Task logic ───────────────────────────────────────────────────────────────
-
-function nextPendingTask(quest: Quest): { task: QuestTask; index: number } | null {
-	for (let i = 0; i < quest.tasks.length; i++) {
-		const t = quest.tasks[i];
-		if (t.status !== "pending") continue;
-		// Check dependencies
-		const allDepsMet = t.dependencies.every(d => quest.tasks[d]?.status === "done");
-		if (!allDepsMet) continue;
-		return { task: t, index: i };
-	}
-	return null;
-}
-
-function formatTaskTime(t: QuestTask): string {
-	if (!t.startedAt) return "";
-	const end = t.completedAt ?? Date.now();
-	const ms = end - t.startedAt;
-	if (ms < 60000) return `${Math.round(ms / 1000)}s`;
-	if (ms < 3600000) return `${Math.round(ms / 60000)}m`;
-	return `${Math.round(ms / 3600000)}h ${Math.round((ms % 3600000) / 60000)}m`;
-}
-
-function formatQuestStatus(quest: Quest): string {
-	const total = quest.tasks.length;
-	const todo = quest.tasks.filter(t => t.status === "pending");
-	const doing = quest.tasks.filter(t => t.status === "running" || t.status === "verifying");
-	const completed = quest.tasks.filter(t => t.status === "done");
-	const done = completed.length;
-	const verified = completed.filter(t => t.verified).length;
-	const failed = quest.tasks.filter(t => t.status === "failed");
-	const skipped = quest.tasks.filter(t => t.status === "skipped");
-	const verifying = quest.tasks.filter(t => t.status === "verifying");
-
-	// Progress bar
-	const barWidth = 20;
-	const doneW = Math.round((done / Math.max(total, 1)) * barWidth);
-	const vfyW = Math.round((verifying.length / Math.max(total, 1)) * barWidth);
-	const failW = Math.round((failed.length / Math.max(total, 1)) * barWidth);
-	const pendW = barWidth - doneW - vfyW - failW;
-	const pbar = `${"█".repeat(doneW)}${"◎".repeat(vfyW)}${"░".repeat(Math.max(pendW, 0))}${"✗".repeat(failW)}`;
-
-	const modeTag = quest.planningMode === "approve" ? ` · mode: ${quest.planningMode}` : "";
-	const approveTag = (quest.planningMode === "approve" && !quest.planApproved) ? ` · ⚠ AWAITING` : "";
-	const verifyTag = quest.verifyOnComplete ? ` · verify: on` : "";
-	const gitTag = quest.gitIntegration?.autoCommit ? ` · git: ${quest.commits.length}c` : "";
-
-	const lines: string[] = [
-		`**Quest: ${quest.name}**  [${quest.status.toUpperCase()}${modeTag}${approveTag}${verifyTag}${gitTag}]`,
-		`Goal: ${quest.goal}`,
-		``,
-		`\`${pbar}\`  ${done}/${total} done${verified > 0 ? ` (${verified} verified)` : ""}`,
-		`${todo.length} todo · ${doing.length} in progress · ${failed.length} failed · ${skipped.length} skipped`,
-	];
-
-	if (quest.tasks.length === 0) {
-		lines.push(``);
-		lines.push("No tasks yet. Use quest_plan to create a task breakdown.");
-	} else {
-		const fmtDep = (t: QuestTask) => t.dependencies.length
-			? ` ← #${t.dependencies.map(d => d + 1).join(",#")}`
-			: "";
-
-		// ── TODO ─────────────────────────────────────────────────────────
-		if (todo.length > 0) {
-			lines.push(``, `━━━ 📋 TODO (${todo.length}) ━━━━━━━━━━━━━━━━━━━━━━━`);
-			for (const t of todo) {
-				const i = quest.tasks.indexOf(t);
-				lines.push(`${ICON[t.status]} #${i + 1} ${t.content}  [${t.agent}]${fmtDep(t)}`);
-			}
-		}
-
-		// ── IN PROGRESS ──────────────────────────────────────────────────
-		if (doing.length > 0) {
-			lines.push(``, `━━━ 🔄 IN PROGRESS (${doing.length}) ━━━━━━━━━━━━━━━`);
-			for (const t of doing) {
-				const i = quest.tasks.indexOf(t);
-				const time = formatTaskTime(t);
-				const timeStr = time ? ` ⏱ ${t.status === "verifying" ? "verifying " : ""}${time}` : "";
-				const vInfo = t.status === "verifying"
-					? (t.verifyResult ? ` — ${t.verifyResult.slice(0, 40)}` : ` — verifying...`)
-					: "";
-				lines.push(`${ICON[t.status]} #${i + 1} ${t.content}  [${t.agent}]${timeStr}${vInfo}${fmtDep(t)}`);
-			}
-		}
-
-		// ── DONE ─────────────────────────────────────────────────────────
-		if (completed.length > 0) {
-			lines.push(``, `━━━ ✅ DONE (${completed.length}) ━━━━━━━━━━━━━━━━━━━━━`);
-			for (const t of completed) {
-				const i = quest.tasks.indexOf(t);
-				const time = formatTaskTime(t);
-				const timeStr = time ? ` ⏱ ${time}` : "";
-				const verifiedStr = t.verified ? ` ✅` : "";
-				const resultSnippet = t.result ? ` — ${t.result.slice(0, 50)}` : "";
-				lines.push(`${ICON[t.status]} #${i + 1} ${t.content}  [${t.agent}]${verifiedStr}${timeStr}${resultSnippet}`);
-			}
-		}
-
-		// ── FAILED / SKIPPED ─────────────────────────────────────────────
-		if (failed.length > 0 || skipped.length > 0) {
-			lines.push(``, `━━━ ❌ FAILED / SKIPPED (${failed.length + skipped.length}) ━━━`);
-			for (const t of [...failed, ...skipped]) {
-				const i = quest.tasks.indexOf(t);
-				const info = t.status === "failed"
-					? ` — attempts ${t.attempts}/${MAX_RETRIES + 1}${t.verifyResult ? ` · ${t.verifyResult.slice(0, 30)}` : ""}`
-					: "";
-				lines.push(`${ICON[t.status]} #${i + 1} ${t.content}  [${t.agent}]${info}`);
-			}
-		}
-	}
-
-	// Warnings
-	if (quest.pauseReason) {
-		lines.push(``, `⚠ ${quest.pauseReason}`);
-	}
-	if (quest.planningMode === "approve" && !quest.planApproved && quest.tasks.length > 0) {
-		lines.push(``, `📋 Plan needs approval. Use /quest approve or quest_approve to start execution.`);
-	}
-	if (quest.status === "active") {
-		lines.push(``, `Auto-pilot: task ${quest.tasksSincePause}/${MAX_BURST} before auto-pause. /quest pause to stop.`);
-	}
-
-	return lines.join("\n");
-}
-
-// ═══════════════════════════════════════════════════════════════
-// Kanban Board Component
-// ═══════════════════════════════════════════════════════════════
-
-class QuestKanban {
-	private quest: Quest;
-	private theme: any;
-	private selectedCol = 0;
-	private selectedRow = 0;
-	private cachedWidth?: number;
-	private cachedLines?: string[];
-	public onClose?: () => void;
-
-	constructor(quest: Quest, theme: any) {
-		this.quest = quest;
-		this.theme = theme;
-	}
-
-	private columns(): { title: string; tasks: QuestTask[]; color: string }[] {
-		const tasks = this.quest.tasks;
-		return [
-			{ title: "TODO", tasks: tasks.filter(t => t.status === "pending"), color: "muted" },
-			{ title: "DOING", tasks: tasks.filter(t => t.status === "running" || t.status === "verifying"), color: "accent" },
-			{ title: "DONE", tasks: tasks.filter(t => t.status === "done"), color: "success" },
-			{ title: "FAILED", tasks: tasks.filter(t => t.status === "failed" || t.status === "skipped"), color: "error" },
-		];
-	}
-
-	handleInput(data: string): void {
-		if (matchesKey(data, Key.escape)) {
-			this.onClose?.();
-			return;
-		}
-		const cols = this.columns();
-		if (matchesKey(data, Key.left)) {
-			if (this.selectedCol > 0) { this.selectedCol--; this.selectedRow = 0; this.invalidate(); }
-		} else if (matchesKey(data, Key.right)) {
-			if (this.selectedCol < cols.length - 1) { this.selectedCol++; this.selectedRow = 0; this.invalidate(); }
-		} else if (matchesKey(data, Key.up)) {
-			if (this.selectedRow > 0) { this.selectedRow--; this.invalidate(); }
-		} else if (matchesKey(data, Key.down)) {
-			if (this.selectedRow < cols[this.selectedCol].tasks.length - 1) { this.selectedRow++; this.invalidate(); }
-		}
-	}
-
-	private formatTaskCell(task: QuestTask, colWidth: number): string {
-		const idx = this.quest.tasks.indexOf(task);
-		const maxContent = colWidth - 5;
-		const content = task.content.length > maxContent
-			? task.content.slice(0, maxContent - 1) + "…"
-			: task.content;
-		return ` ${ICON[task.status]}#${idx + 1} ${content}`;
-	}
-
-	render(width: number): string[] {
-		if (this.cachedLines && this.cachedWidth === width) return this.cachedLines;
-
-		const theme = this.theme;
-		const cols = this.columns();
-		const numCols = 4;
-		const gap = 2;
-		const colWidth = Math.floor((width - (numCols - 1) * gap) / numCols);
-		const maxRows = Math.max(...cols.map(c => c.tasks.length), 1);
-		const totalTasks = cols.reduce((sum, c) => sum + c.tasks.length, 0);
-
-		const lines: string[] = [];
-
-		// Title bar
-		const statusTag = this.quest.status.toUpperCase();
-		const title = `Quest: ${this.quest.name} [${statusTag}] — ${totalTasks} tasks`;
-		lines.push(theme.fg("accent", theme.bold(title)));
-		lines.push("");
-
-		// Empty quest
-		if (totalTasks === 0) {
-			lines.push(theme.fg("muted", "  No tasks yet. Create a plan with quest_plan."));
-			lines.push("");
-			lines.push(theme.fg("dim", "esc close"));
-			this.cachedWidth = width;
-			this.cachedLines = lines;
-			return lines;
-		}
-
-		// Column headers
-		const headerLine = cols.map((c, ci) => {
-			const hdr = ` ${c.title} (${c.tasks.length}) `;
-			const padded = hdr.padEnd(colWidth).slice(0, colWidth);
-			const colored = theme.fg(c.color, padded);
-			return ci === this.selectedCol
-				? theme.bg("selectedBg", colored)
-				: colored;
-		}).join(" ".repeat(gap));
-		lines.push(headerLine);
-
-		// Header separator
-		const sep = cols.map(() => "─".repeat(colWidth)).join(" ".repeat(gap));
-		lines.push(theme.fg("dim", sep));
-
-		// Task rows
-		for (let r = 0; r < maxRows; r++) {
-			const rowParts = cols.map((c, ci) => {
-				const task = c.tasks[r];
-				const isSelected = ci === this.selectedCol && r === this.selectedRow;
-				let cell = task ? this.formatTaskCell(task, colWidth) : "";
-				cell = cell.padEnd(colWidth).slice(0, colWidth);
-				if (isSelected && task) {
-					return theme.bg("selectedBg", theme.fg("text", cell));
-				} else if (task) {
-					return theme.fg(c.color, cell);
-				} else {
-					return theme.fg("dim", cell || " ".repeat(colWidth));
-				}
-			});
-			lines.push(rowParts.join(" ".repeat(gap)));
-		}
-
-		// Help bar
-		lines.push("");
-		lines.push(theme.fg("dim", "←→ columns  ↑↓ tasks  esc close"));
-
-		this.cachedWidth = width;
-		this.cachedLines = lines;
-		return lines;
-	}
-
-	invalidate(): void {
-		this.cachedWidth = undefined;
-		this.cachedLines = undefined;
-	}
-}
-
-type SyncedTodoStatus = "pending" | "in_progress" | "completed" | "delegated";
-
-interface SyncedTodoItem {
-	content: string;
-	status: SyncedTodoStatus;
-	agent?: string;
-	context?: string;
-	result?: string;
-	source?: string;
-	sourceId?: string;
-	sourceIndex?: number;
-	createdAt: number;
-	completedAt: number | null;
-}
-
-interface SyncedTodoList {
-	cwd: string;
-	title?: string;
-	items: SyncedTodoItem[];
-	version: 1;
-}
-
-function todoPath(cwd: string): string {
-	return join(AGENT_DIR, "tmp", "todos", `${cwdHash(cwd)}.json`);
-}
-
-function questTaskToTodo(quest: Quest, task: QuestTask, index: number, previous?: SyncedTodoItem): SyncedTodoItem {
-	const now = Date.now();
-	const failed = task.status === "failed";
-	const completed = task.status === "done" || task.status === "skipped" || failed;
-	const status: SyncedTodoStatus = task.status === "running"
-		? "in_progress"
-		: completed
-			? "completed"
-			: "pending";
-	const result = failed
-		? `[failed] ${task.result ?? task.verifyResult ?? "Task failed"}`
-		: task.result ?? undefined;
-
-	return {
-		content: `[Quest] #${index + 1} ${task.content}`,
-		status,
-		agent: task.agent,
-		context: task.context,
-		result,
-		source: "quest",
-		sourceId: quest.name,
-		sourceIndex: index,
-		createdAt: previous?.createdAt ?? task.startedAt ?? now,
-		completedAt: completed ? (previous?.completedAt ?? task.completedAt ?? now) : null,
-	};
-}
-
-function syncQuestToTodo(quest: Quest, cwd: string): void {
-	try {
-		const path = todoPath(cwd);
-		const existing = readJSON<SyncedTodoList>(path, { cwd, items: [], version: 1 });
-		const existingItems = Array.isArray(existing.items) ? existing.items : [];
-		const previousQuestItems = new Map<number, SyncedTodoItem>();
-		for (const item of existingItems) {
-			if (item?.source === "quest" && typeof item.sourceIndex === "number") {
-				previousQuestItems.set(item.sourceIndex, item);
-			}
-		}
-		const nonQuestItems = existingItems.filter(item => item?.source !== "quest" && !item?.content?.startsWith("[Quest]"));
-		const questItems = quest.tasks.map((task, index) => questTaskToTodo(quest, task, index, previousQuestItems.get(index)));
-		const next: SyncedTodoList = {
-			cwd: existing.cwd ?? cwd,
-			title: existing.title ?? `Quest: ${quest.name}`,
-			items: [...nonQuestItems, ...questItems],
-			version: 1,
-		};
-		writeJSON(path, next);
-	} catch { /* optional — pi-todo may not be installed */ }
-}
-
-function compactAwarenessBlock(cwd: string): string {
-	try {
-		const memory = loadProjectMemory(cwd);
-		const todo = readJSON<SyncedTodoList | null>(todoPath(cwd), null);
-		const meta = readJSON<any>(SESSION_META_PATH, { extensions: {} });
-		const memoryMeta = meta.extensions?.memory ?? {};
-		const todoMeta = meta.extensions?.todo ?? {};
-		const lines: string[] = [];
-
-		const now = new Date();
-		lines.push(`Date: ${now.toLocaleString("en-US", { weekday: "short", year: "numeric", month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", timeZone: "UTC", timeZoneName: "short" })}`);
-
-		const language = memory?.language ?? memoryMeta.language;
-		const framework = memory?.framework ?? memoryMeta.framework;
-		const packageManager = memory?.packageManager ?? memoryMeta.packageManager;
-		const conventions = Array.isArray(memory?.conventions) ? memory.conventions.slice(0, 5) : [];
-		const tech = [language, framework, packageManager].filter(Boolean).join(" • ");
-		if (memory || tech || conventions.length) {
-			lines.push(`Memory: ${memory?.name ?? memoryMeta.name ?? basename(cwd)}${tech ? ` (${tech})` : ""}`);
-			if (conventions.length) lines.push(`Conventions: ${conventions.join("; ")}${memory?.conventions?.length > conventions.length ? "…" : ""}`);
-		}
-
-		// Research findings from project memory
-		const research = memory?.research as Record<string, { value: string; category?: string; timestamp: number }> | undefined;
-		if (research) {
-			const entries = Object.entries(research)
-				.sort(([, a], [, b]) => b.timestamp - a.timestamp)
-				.slice(0, 5);
-			if (entries.length) {
-				const lines2 = entries.map(([k, v]) => {
-					const cat = v.category ? `[${v.category}] ` : "";
-					const val = v.value.length > 80 ? v.value.slice(0, 77) + "…" : v.value;
-					return `- ${k}: ${cat}${val}`;
-				});
-				lines.push(`Research:\n${lines2.join("\n")}`);
-			}
-		}
-
-		const items = Array.isArray(todo?.items) ? todo.items : [];
-		const total = typeof todoMeta.total === "number" ? todoMeta.total : items.length;
-		if (total > 0) {
-			const completed = typeof todoMeta.completed === "number" ? todoMeta.completed : items.filter(i => i.status === "completed").length;
-			const inProgress = typeof todoMeta.inProgress === "number" ? todoMeta.inProgress : items.filter(i => i.status === "in_progress").length;
-			const delegated = typeof todoMeta.delegated === "number" ? todoMeta.delegated : items.filter(i => i.status === "delegated").length;
-			lines.push(`Todo: ${completed}/${total} done${inProgress ? ` · ${inProgress} active` : ""}${delegated ? ` · ${delegated} delegated` : ""}`);
-		}
-
-		const block = lines.length ? `\n\n## Project Awareness\n${lines.join("\n")}` : "";
-		return block.length > 1200 ? `${block.slice(0, 1197)}...` : block;
-	} catch { return ""; }
-}
-
-// ── Status badge ─────────────────────────────────────────────────────────────
-
-function writeQuestSessionMeta(cwd: string, quest: Quest | null): void {
-	if (!quest || quest.status === "idle" || quest.status === "done") {
-		writeSessionMeta("quest", cwd, { status: "idle", done: 0, total: 0 });
-		return;
-	}
-	writeSessionMeta("quest", cwd, {
-		name: quest.name,
-		status: quest.status,
-		done: quest.tasks.filter(t => t.status === "done").length,
-		total: quest.tasks.length,
-	});
-}
-
-function renderStatus(ctx: ExtensionContext, quest: Quest | null) {
-	const theme = (ctx.ui as any).theme;
-	if (!quest || quest.status === "idle" || quest.status === "done") {
-		ctx.ui.setStatus?.("quest", "");
-		return;
-	}
-	const done = quest.tasks.filter(t => t.status === "done").length;
-	const total = quest.tasks.length;
-	const icon = quest.status === "active" ? "⚔" : quest.status === "planning" ? "📋" : "⏸";
-	const label = total ? `${icon} ${done}/${total}` : `${icon} plan`;
-	const color = quest.status === "active" ? "warning" : "dim";
-	ctx.ui.setStatus?.("quest", theme?.fg ? theme.fg(color, label) : label);
-}
-
-// ── Auto-pilot injection ─────────────────────────────────────────────────────
-
-function buildSteeringMessage(quest: Quest, task: QuestTask, index: number, cwd: string): string {
-	const done = quest.tasks.filter(t => t.status === "done").length;
-	const total = quest.tasks.length;
-
-	const deps = task.dependencies
-		.map(d => `#${d + 1} — ${quest.tasks[d].content}`)
-		.join(", ");
-
-	return [
-		`## Quest: ${quest.name} (${done}/${total} done)`,
-		``,
-		`**Current task:** ${task.content}`,
-		`**Use subagent:** \`${task.agent}\``,
-		`**Context:** ${task.context}`,
-		deps ? `**Depends on:** ${deps}` : "",
-		compactAwarenessBlock(cwd),
-		``,
-		`When complete, call **quest_update** with task index ${index} to mark it done.`,
-		`If you hit a blocker you can't resolve, call quest_update with status "failed" and explain why.`,
-		``,
-		`Auto-pilot: ${quest.tasksSincePause + 1}/${MAX_BURST} — /quest pause to stop.`,
-	].filter(Boolean).join("\n");
-}
-
-// ── Extension ────────────────────────────────────────────────────────────────
+import type { Quest, QuestTask, TaskStatus, SyncedTodoList } from "./types";
+import { MAX_BURST, MAX_RETRIES, MAX_VERIFY_RETRIES, TEAMS_DIR } from "./constants";
+import { readJSON, writeJSON, projectMemoryPath } from "./utils";
+import { emptyQuest, loadQuest, saveQuest, archiveQuest, syncConventionsToMemory, listArchives } from "./storage";
+import { loadTeams, ensureBuiltInTeams, teamInstallFromGit } from "./teams";
+import { syncQuestToTodo, compactAwarenessBlock } from "./todo-sync";
+import { renderStatus, writeQuestSessionMeta } from "./status";
+import { nextPendingTask, formatQuestStatus, buildSteeringMessage } from "./steering";
+import { QuestKanban } from "./kanban";
 
 export default function (pi: ExtensionAPI) {
 	let questCache: Quest | null = null;
-	let autoPilotLocked = false; // prevent re-entry
+	let autoPilotLocked = false;
 
 	function getQuest(): Quest | null {
 		if (!questCache) questCache = loadQuest();
 		return questCache;
+	}
+
+	function validateAndSetTeam(quest: Quest, teamName?: string): void {
+		if (!teamName) return;
+		ensureBuiltInTeams();
+		const config = loadTeams()[teamName];
+		if (config) {
+			quest.team = teamName;
+		}
 	}
 
 	// ── Tools ────────────────────────────────────────────────────────────────
@@ -985,7 +70,8 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 
-			const quest = emptyQuest(params.name, params.goal, params.team, params.planningMode ?? "auto", params.verifyOnComplete ?? true, params.gitIntegration);
+			const quest = emptyQuest(params.name, params.goal, undefined, params.planningMode ?? "auto", params.verifyOnComplete ?? true, params.gitIntegration);
+			validateAndSetTeam(quest, params.team);
 			saveQuest(quest);
 			questCache = quest;
 			renderStatus(ctx, quest);
@@ -1116,9 +202,13 @@ export default function (pi: ExtensionAPI) {
 				attempts: 0,
 				startedAt: null,
 				completedAt: null,
+				verified: false,
+				verifyResult: null,
+				verifyRetries: 0,
+				commitHash: null,
+				branchName: null,
 			}));
 
-			// Validate dependencies
 			for (let i = 0; i < quest.tasks.length; i++) {
 				for (const dep of quest.tasks[i].dependencies) {
 					if (dep < 0 || dep >= quest.tasks.length || dep === i) {
@@ -1132,19 +222,12 @@ export default function (pi: ExtensionAPI) {
 
 			const needsApproval = quest.planningMode === "approve" && !quest.planApproved;
 
-			// ── Interactive plan review (when UI is available) ──────────────────
-			// Format plan summary once for both confirm + fallback
-			const tasksPreview = quest.tasks.slice(0, 6).map((t, i) =>
-				`${i + 1}. **${t.content}** [${t.agent}]${t.dependencies.length ? ` ← #${t.dependencies.map(d => d + 1).join(", #")}` : ""}\n   ${t.context}`
-			).join("\n\n");
-
 			const fullPlan = quest.tasks.map((t, i) => {
 				const deps = t.dependencies.length ? ` (requires: ${t.dependencies.map(d => quest.tasks[d].content).join(", ")})` : "";
 				return `${i + 1}. **${t.content}** [${t.agent}]${deps}\n   ${t.context}`;
 			}).join("\n\n");
 
 			if (needsApproval && ctx.hasUI) {
-				// Show plan and ask user to approve
 				const confirmMsg = [
 					`**Quest:** ${quest.name}`,
 					`**Goal:** ${quest.goal}`,
@@ -1160,7 +243,6 @@ export default function (pi: ExtensionAPI) {
 				const approved = await ctx.ui.confirm("Review Quest Plan", confirmMsg);
 
 				if (approved) {
-					// User approved — start immediately
 					quest.planApproved = true;
 					quest.status = "active";
 					quest.tasksSincePause = 0;
@@ -1193,7 +275,6 @@ export default function (pi: ExtensionAPI) {
 					};
 				}
 
-				// User declined — ask what to do
 				const action = await ctx.ui.select(
 					"Plan not approved. What would you like to do?",
 					["Edit tasks before approving", "Re-plan from scratch", "Cancel (keep plan for later)"],
@@ -1270,10 +351,8 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 
-			// ── No UI or auto-start: existing logic ────────────────────────────
 			if (params.autoStart !== false) {
 				if (needsApproval) {
-					// Stay in planning if headless (already handled interactive)
 					quest.status = "planning";
 					quest.pauseReason = "Plan ready — awaiting approval. Use quest_approve or /quest approve to start.";
 				} else {
@@ -1414,7 +493,6 @@ export default function (pi: ExtensionAPI) {
 				const retriesLeft = MAX_VERIFY_RETRIES - task.verifyRetries;
 
 				if (retriesLeft > 0) {
-					// Retry: reset to pending with fix context
 					task.status = "pending";
 					task.attempts = 0;
 					task.startedAt = null;
@@ -1472,9 +550,8 @@ export default function (pi: ExtensionAPI) {
 
 			// ── Normal completion — check if verification needed ─────────────
 			if (params.status === "done" && quest.verifyOnComplete) {
-				// Check if team has a verifier configured
 				const team = quest.team ? loadTeams()[quest.team] : null;
-				const hasVerifier = team?.verification ?? true; // default true for unteamed quests
+				const hasVerifier = team?.verification ?? true;
 
 				if (hasVerifier) {
 					task.status = "verifying";
@@ -1518,14 +595,12 @@ export default function (pi: ExtensionAPI) {
 				}
 			}
 
-			// ── Normal status update (no verification, or FAIL/skipped) ──────
 			task.status = params.status;
 			if (params.result) task.result = params.result;
 			if (params.status === "done" || params.status === "failed") {
 				task.completedAt = Date.now();
 			}
 
-			// Git integration: prompt for commit on task completion
 			const git = quest.gitIntegration;
 			const gitPrompt = (params.status === "done" && git?.autoCommit)
 				? [
@@ -1545,7 +620,6 @@ export default function (pi: ExtensionAPI) {
 				].filter(Boolean).join("\n")
 				: "";
 
-			// Clear stall tracking since we made progress
 			quest.lastFiredTaskIndex = -1;
 			quest.sameTaskCount = 0;
 
@@ -1610,7 +684,6 @@ export default function (pi: ExtensionAPI) {
 				return { content: [{ type: "text", text: "No tasks to approve. Use quest_plan to create a task breakdown first." }], details: {} };
 			}
 
-			// Apply edits if provided
 			let editsApplied = 0;
 			if (params.edits) {
 				for (const edit of params.edits) {
@@ -1626,7 +699,6 @@ export default function (pi: ExtensionAPI) {
 				}
 			}
 
-			// Interactive confirmation (when UI available)
 			if (ctx.hasUI) {
 				const planSummary = quest.tasks.map((t, i) => {
 					const deps = t.dependencies.length ? ` (requires: ${t.dependencies.map(d => quest.tasks[d].content).join(", ")})` : "";
@@ -1647,7 +719,6 @@ export default function (pi: ExtensionAPI) {
 
 				const approved = await ctx.ui.confirm("Approve Quest Plan", confirmMsg);
 				if (!approved) {
-					// Save edits but stay in planning
 					saveQuest(quest);
 					questCache = quest;
 					renderStatus(ctx, quest);
@@ -1668,7 +739,6 @@ export default function (pi: ExtensionAPI) {
 				}
 			}
 
-			// Transition to active
 			quest.planApproved = true;
 			quest.status = "active";
 			quest.tasksSincePause = 0;
@@ -1744,7 +814,6 @@ export default function (pi: ExtensionAPI) {
 			task.commitHash = params.commitHash;
 			if (params.branchName) task.branchName = params.branchName;
 
-			// Add to quest commit log
 			quest.commits.push({
 				taskIndex: params.taskIndex,
 				hash: params.commitHash,
@@ -1821,7 +890,6 @@ export default function (pi: ExtensionAPI) {
 				lines.push(``);
 			}
 
-			// PR-ready summary
 			if (git?.autoPR) {
 				lines.push(`---`);
 				lines.push(``);
@@ -1920,10 +988,8 @@ export default function (pi: ExtensionAPI) {
 				return { content: [{ type: "text", text: "No active quest. Use quest_create first." }], details: {} };
 			}
 
-			// Initialize researchFindings if needed
 			if (!quest.researchFindings) quest.researchFindings = [];
 
-			// Upsert by key
 			const existing = quest.researchFindings.find(f => f.key === params.key);
 			const timestamp = Date.now();
 			if (existing) {
@@ -1944,7 +1010,6 @@ export default function (pi: ExtensionAPI) {
 			renderStatus(ctx, quest);
 			writeQuestSessionMeta(ctx.cwd, quest);
 
-			// Best-effort sync to project memory
 			try {
 				const memoryPath = projectMemoryPath(ctx.cwd);
 				const memory = readJSON<Record<string, any>>(memoryPath, {});
@@ -1982,10 +1047,8 @@ export default function (pi: ExtensionAPI) {
 
 		const next = nextPendingTask(quest);
 		if (!next) {
-			// Check for stuck verification tasks
 			const verifyingTasks = quest.tasks.filter(t => t.status === "verifying");
 			if (verifyingTasks.length > 0) {
-				// If only verifying tasks remain (all others done/skipped/failed)
 				const allResolved = quest.tasks.every(t =>
 					t.status === "done" || t.status === "skipped" || t.status === "failed" || t.status === "verifying"
 				);
@@ -2002,7 +1065,6 @@ export default function (pi: ExtensionAPI) {
 						);
 
 						if (action === "Verify them now (agent will handle it)") {
-							// Send steering message so agent runs verification
 							autoPilotLocked = true;
 							pi.sendUserMessage(
 								[
@@ -2035,11 +1097,8 @@ export default function (pi: ExtensionAPI) {
 							writeQuestSessionMeta(ctx.cwd, quest);
 							syncQuestToTodo(quest, ctx.cwd);
 							ctx.ui.notify(`${verifyingTasks.length} task(s) verified (skipped). Continuing...`, "info");
-							// agent_end will fire again and auto-complete
 							return;
 						}
-
-						// Pause — fall through
 					}
 
 					quest.status = "paused";
@@ -2076,7 +1135,6 @@ export default function (pi: ExtensionAPI) {
 				}
 			}
 
-			// All tasks done or blocked
 			const allDone = quest.tasks.every(t => t.status === "done" || t.status === "skipped");
 			const anyFailed = quest.tasks.some(t => t.status === "failed");
 
@@ -2176,8 +1234,6 @@ export default function (pi: ExtensionAPI) {
 						ctx.ui.notify(`${failedTasks.length} task(s) skipped. Auto-pilot resuming.`, "info");
 						return;
 					}
-
-					// Pause and review — fall through
 				}
 
 				quest.status = "paused";
@@ -2208,7 +1264,6 @@ export default function (pi: ExtensionAPI) {
 					autoPilotLocked = false;
 				}
 			} else {
-				// All pending tasks are blocked by dependencies
 				quest.status = "paused";
 				quest.pauseReason = "All remaining tasks are blocked by unfinished dependencies.";
 				saveQuest(quest);
@@ -2220,7 +1275,7 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 
-		// Stall detection: same task fired again without progress
+		// Stall detection
 		if (next.index === quest.lastFiredTaskIndex) {
 			quest.sameTaskCount++;
 			if (quest.sameTaskCount > 2) {
@@ -2259,8 +1314,6 @@ export default function (pi: ExtensionAPI) {
 						ctx.ui.notify(`Task #${next.index + 1} marked failed.`, "warning");
 						return;
 					}
-
-					// Pause — fall through
 				}
 
 				quest.status = "paused";
@@ -2289,7 +1342,6 @@ export default function (pi: ExtensionAPI) {
 			quest.sameTaskCount = 1;
 		}
 
-		// Retry limit: task has been attempted too many times
 		if (next.task.attempts > MAX_RETRIES) {
 			next.task.status = "failed";
 			next.task.result = `Auto-failed after ${MAX_RETRIES + 1} attempts.`;
@@ -2300,12 +1352,9 @@ export default function (pi: ExtensionAPI) {
 			renderStatus(ctx, quest);
 			writeQuestSessionMeta(ctx.cwd, quest);
 			syncQuestToTodo(quest, ctx.cwd);
-			// Don't return — retry with the next pending task
-			// This will trigger agent_end again, which will find the next task
 			return;
 		}
 
-		// Burst limit: ask user before continuing
 		if (quest.tasksSincePause >= MAX_BURST) {
 			const done = quest.tasks.filter(t => t.status === "done").length;
 			const total = quest.tasks.length;
@@ -2323,7 +1372,6 @@ export default function (pi: ExtensionAPI) {
 				);
 
 				if (cont) {
-					// Reset burst counter and continue
 					quest.tasksSincePause = 0;
 					quest.lastFiredTaskIndex = -1;
 					quest.sameTaskCount = 0;
@@ -2332,7 +1380,6 @@ export default function (pi: ExtensionAPI) {
 					renderStatus(ctx, quest);
 					writeQuestSessionMeta(ctx.cwd, quest);
 					syncQuestToTodo(quest, ctx.cwd);
-					// Fall through to fire the next task
 				} else {
 					quest.status = "paused";
 					quest.pauseReason = `User paused at checkpoint after ${quest.tasksSincePause} tasks. /quest resume to continue.`;
@@ -2347,7 +1394,6 @@ export default function (pi: ExtensionAPI) {
 					return;
 				}
 			} else {
-				// Headless: auto-pause
 				quest.status = "paused";
 				quest.pauseReason = `Auto-paused after ${MAX_BURST} tasks. /quest resume to continue.`;
 				quest.lastFiredTaskIndex = -1;
@@ -2396,7 +1442,6 @@ export default function (pi: ExtensionAPI) {
 		writeQuestSessionMeta(ctx.cwd, questCache);
 		if (questCache?.status === "active") syncQuestToTodo(questCache, ctx.cwd);
 
-		// Notify about active quest
 		if (questCache?.status === "active") {
 			ctx.ui.notify(
 				`Quest active: ${questCache.name} (${questCache.tasks.filter(t => t.status === "done").length}/${questCache.tasks.length} done)`,
@@ -2479,7 +1524,6 @@ export default function (pi: ExtensionAPI) {
 						"info",
 					);
 
-					// Auto-inject planning prompt
 					autoPilotLocked = true;
 					pi.sendUserMessage(
 						[
@@ -2591,7 +1635,6 @@ export default function (pi: ExtensionAPI) {
 						ctx.ui.notify("No tasks planned. Use quest_plan to add tasks first.", "error");
 						return;
 					}
-					// Check approval gate
 					if (quest.planningMode === "approve" && !quest.planApproved) {
 						ctx.ui.notify(
 							"This quest requires plan approval before starting.\n\nUse /quest approve to review and approve the plan.",
