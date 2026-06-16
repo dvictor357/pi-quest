@@ -38,7 +38,11 @@ During the planning phase, Quest instructs agents to research the latest informa
 | **Max burst** | Auto-pauses after 6 consecutive tasks — `/quest resume` to continue |
 | **Stall detection** | Same task 3 times without progress → pauses |
 | **Retry limit** | 2 retries per task, then auto-marked failed |
-| **Re-entry lock** | Prevents double-firing of steering messages |
+| **Verify retries** | 2 verification retries per task before auto-fail |
+| **Re-entry lock** | Prevents double-firing of steering messages (try/finally sealed) |
+| **Cycle detection** | DFS-based dependency cycle detection in quest_plan |
+| **Depth limit** | Maximum dependency depth of 3 enforced |
+| **Crash recovery** | agent_end handler wrapped in try/catch — pauses quest on error |
 
 ### Lifecycle
 
@@ -61,13 +65,18 @@ pi install git:github.com/dvictor357/pi-quest
 
 | Command | Does |
 |---------|------|
-| `/quest` | Show current quest status |
+| `/quest` | Open kanban board (or status text in headless) |
 | `/quest create <name>: <goal>` | Create a new quest + auto-inject planning prompt |
-| `/quest start` | Manually start a quest (if not auto-started) |
+| `/quest start` | Manually start a quest |
 | `/quest pause` | Pause auto-pilot |
 | `/quest resume` | Resume auto-pilot |
+| `/quest approve` | Approve a plan (when planningMode=approve) |
+| `/quest cancel` | Abort and archive the current quest |
+| `/quest kanban` | Open kanban board overlay |
 | `/quest status` | Full quest progress with task list |
+| `/quest git` | Show git integration config + recorded commits |
 | `/quest history [N]` | Browse past completed quests |
+| `/quest team [list\|install <url>\|create]` | Manage team configurations |
 
 ### Agent tools
 
@@ -76,7 +85,14 @@ pi install git:github.com/dvictor357/pi-quest
 | `quest_create` | Create a new quest from a goal |
 | `quest_plan` | Save a task breakdown (after scout + planner) |
 | `quest_update` | Mark a task done/failed/skipped with result |
+| `quest_approve` | Approve a plan (planningMode=approve) with optional edits |
+| `quest_decide` | Ask the user a branching decision |
+| `quest_abort` | Permanently archive and clear the current quest |
 | `quest_status` | Show current quest progress |
+| `quest_task_detail` | Get full context + timing for a specific task |
+| `quest_commit` | Record a git commit against a task |
+| `quest_git_summary` | Review all commits + generate PR summary |
+| `quest_team` | List available team configurations |
 | `quest_history` | Browse past quests |
 | `quest_memory_save` | Save research findings to quest + project memory |
 
@@ -108,9 +124,11 @@ See the [cross-extension cohesion contract](docs/cross-extension-cohesion.md) fo
 
 ## Storage
 
+Each project gets its own quest directory, keyed by `sha256(cwd).slice(0, 16)`:
+
 ```
-~/.pi/agent/quests/
-├── active.json              # Current quest (one at a time)
+~/.pi/agent/quests/<cwdHash>/
+├── active.json              # Current quest for this project
 └── archive/
     ├── archive-index.json    # Lightweight manifest for fast history
     └── <ts>-<name>.json     # Completed quests
