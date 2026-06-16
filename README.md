@@ -95,8 +95,10 @@ pi install git:github.com/dvictor357/pi-quest
 ## Integration
 
 - **pi-subagent** — Quest tells the agent which sub-agent to use for each task
-- **pi-todo** — Quest status syncs to the todo list for footer badge visibility
-- **pi-memory** — On completion, Quest prompts the agent to save project conventions
+- **pi-todo** — Quest syncs tasks directly to the todo JSON store; todo detects changes and reloads automatically. The status bar reflects quest progress without the agent needing to call `todo_write`.
+- **pi-memory** — On quest completion, conventions are merged directly into the project memory profile (deduped via Set). Planner and worker turns receive a compact project-awareness block with language, framework, conventions, and todo counts.
+
+See the [cross-extension cohesion contract](docs/cross-extension-cohesion.md) for the full storage contract and status semantics.
 
 ## Storage
 
@@ -104,6 +106,7 @@ pi install git:github.com/dvictor357/pi-quest
 ~/.pi/agent/quests/
 ├── active.json              # Current quest (one at a time)
 └── archive/
+    ├── archive-index.json    # Lightweight manifest for fast history
     └── <ts>-<name>.json     # Completed quests
 ```
 

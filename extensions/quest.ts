@@ -31,7 +31,7 @@ import { Type } from "typebox";
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync, rmSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { execSync } from "node:child_process";
 
 // ── Types ────────────────────────────────────────────────────────────────────
@@ -99,8 +99,11 @@ const MAX_BURST = 6; // auto-pause after this many consecutive tasks
 const MAX_RETRIES = 2; // per task, before marking failed
 const MAX_VERIFY_RETRIES = 2; // verification retries before marking task failed
 const MAX_DEPENDENCY_DEPTH = 3; // sanity check
-const ACTIVE_PATH = join(homedir(), ".pi", "agent", "quests", "active.json");
-const ARCHIVE_DIR = join(homedir(), ".pi", "agent", "quests", "archive");
+const AGENT_DIR = join(homedir(), ".pi", "agent");
+const ACTIVE_PATH = join(AGENT_DIR, "quests", "active.json");
+const ARCHIVE_DIR = join(AGENT_DIR, "quests", "archive");
+const MEMORY_PROJECTS_DIR = join(AGENT_DIR, "memory", "projects");
+const SESSION_META_PATH = join(AGENT_DIR, "session-meta.json");
 
 const ICON: Record<TaskStatus, string> = {
 	pending: "☐",
@@ -111,7 +114,7 @@ const ICON: Record<TaskStatus, string> = {
 	skipped: "⏭",
 };
 
-const TEAMS_DIR = join(homedir(), ".pi", "agent", "quests", "teams");
+const TEAMS_DIR = join(AGENT_DIR, "quests", "teams");
 
 const BUILT_IN_TEAMS: Record<string, TeamConfig> = {
 	engineering: {
@@ -167,6 +170,63 @@ const BUILT_IN_TEAMS: Record<string, TeamConfig> = {
 };
 
 // ── Storage ──────────────────────────────────────────────────────────────────
+
+function cwdHash(cwd: string): string {
+	return createHash("sha256").update(cwd).digest("hex").slice(0, 16);
+}
+
+function readJSON<T>(path: string, fallback: T): T {
+	try {
+		if (existsSync(path)) return JSON.parse(readFileSync(path, "utf8"));
+	} catch { /* corrupt → fallback */ }
+	return fallback;
+}
+
+function writeJSON(path: string, data: unknown): void {
+	try {
+		mkdirSync(dirname(path), { recursive: true });
+		writeFileSync(path, `${JSON.stringify(data, null, 2)}\n`, "utf8");
+	} catch { /* best-effort */ }
+}
+
+function writeSessionMeta(key: "memory" | "todo" | "quest", cwd: string, data: Record<string, unknown>): void {
+	try {
+		const existing = readJSON<{ cwd?: string; cwdHash?: string; updatedAt?: number; extensions?: Record<string, unknown> }>(SESSION_META_PATH, { extensions: {} });
+		const next = {
+			...existing,
+			cwd,
+			cwdHash: cwdHash(cwd),
+			updatedAt: Date.now(),
+			extensions: {
+				...(existing.extensions ?? {}),
+				[key]: { ...data, updatedAt: Date.now() },
+			},
+		};
+		writeJSON(SESSION_META_PATH, next);
+	} catch { /* best-effort cross-extension metadata */ }
+}
+
+function projectMemoryPath(cwd: string): string {
+	return join(MEMORY_PROJECTS_DIR, `${cwdHash(cwd)}.json`);
+}
+
+function loadProjectMemory(cwd: string): Record<string, any> | null {
+	return readJSON<Record<string, any> | null>(projectMemoryPath(cwd), null);
+}
+
+function syncConventionsToMemory(quest: Quest, cwd: string): void {
+	try {
+		if (!quest.conventions.length) return;
+		const existing = loadProjectMemory(cwd) ?? {
+			name: basename(cwd),
+			conventions: [],
+			lastScanned: 0,
+		};
+		const conventions = Array.isArray(existing.conventions) ? existing.conventions : [];
+		const merged = [...new Set([...conventions, ...quest.conventions])];
+		writeJSON(projectMemoryPath(cwd), { ...existing, conventions: merged, lastModified: Date.now() });
+	} catch { /* optional — pi-memory may not be installed */ }
+}
 
 function emptyQuest(name: string, goal: string, team?: string, planningMode: "auto" | "approve" = "auto", verifyOnComplete = true, gitIntegration?: GitIntegration): Quest {
 	const quest: Quest = {
@@ -241,22 +301,62 @@ function loadQuest(): Quest | null {
 }
 
 function saveQuest(quest: Quest): void {
-	try {
-		quest.updatedAt = Date.now();
-		mkdirSync(join(homedir(), ".pi", "agent", "quests"), { recursive: true });
-		writeFileSync(ACTIVE_PATH, `${JSON.stringify(quest, null, 2)}\n`, "utf8");
-	} catch { /* best-effort */ }
+	quest.updatedAt = Date.now();
+	writeJSON(ACTIVE_PATH, quest);
 }
 
 function archiveQuest(quest: Quest): string | null {
 	try {
-		mkdirSync(ARCHIVE_DIR, { recursive: true });
 		const slug = quest.name.replace(/[^a-z0-9-]+/gi, "-").toLowerCase();
 		const ts = quest.completedAt ?? Date.now();
 		const path = join(ARCHIVE_DIR, `${ts}-${slug}.json`);
-		writeFileSync(path, `${JSON.stringify(quest, null, 2)}\n`, "utf8");
+		writeJSON(path, quest);
+		updateArchiveIndex({
+			path,
+			name: quest.name,
+			goal: quest.goal,
+			completedAt: quest.completedAt ?? Date.now(),
+			taskCount: quest.tasks.length,
+			doneCount: quest.tasks.filter(t => t.status === "done").length,
+		});
 		return path;
 	} catch { return null; }
+}
+
+const ARCHIVE_INDEX_PATH = join(ARCHIVE_DIR, "archive-index.json");
+
+function updateArchiveIndex(entry: { path: string; name: string; goal: string; completedAt: number; taskCount: number; doneCount: number }): void {
+	try {
+		const index = readJSON<{ version: 1; entries: any[] }>(ARCHIVE_INDEX_PATH, { version: 1, entries: [] });
+		index.entries = index.entries.filter((e: any) => e.path !== entry.path);
+		index.entries.push(entry);
+		index.entries.sort((a: any, b: any) => (b.completedAt || 0) - (a.completedAt || 0));
+		writeJSON(ARCHIVE_INDEX_PATH, index);
+	} catch { /* best-effort */ }
+}
+
+function rebuildArchiveIndex(): void {
+	try {
+		if (!existsSync(ARCHIVE_DIR)) return;
+		const entries: any[] = [];
+		const files = readdirSync(ARCHIVE_DIR)
+			.filter(f => f.endsWith(".json") && f !== "archive-index.json");
+		for (const f of files) {
+			try {
+				const raw = JSON.parse(readFileSync(join(ARCHIVE_DIR, f), "utf8"));
+				entries.push({
+					path: join(ARCHIVE_DIR, f),
+					name: raw.name || f,
+					goal: raw.goal || "",
+					completedAt: raw.completedAt || null,
+					taskCount: Array.isArray(raw.tasks) ? raw.tasks.length : 0,
+					doneCount: Array.isArray(raw.tasks) ? raw.tasks.filter((t: any) => t.status === "done").length : 0,
+				});
+			} catch { /* skip corrupt */ }
+		}
+		entries.sort((a: any, b: any) => (b.completedAt || 0) - (a.completedAt || 0));
+		writeJSON(ARCHIVE_INDEX_PATH, { version: 1, entries });
+	} catch { /* best-effort */ }
 }
 
 // ── Team config helpers ──────────────────────────────────────────────────────
@@ -378,23 +478,27 @@ function teamInstallFromGit(url: string): { success: boolean; team?: TeamConfig;
 function listArchives(limit: number): { name: string; goal: string; tasks: number; done: number; completedAt: number | null }[] {
 	try {
 		if (!existsSync(ARCHIVE_DIR)) return [];
-		return readdirSync(ARCHIVE_DIR)
-			.filter(f => f.endsWith(".json"))
-			.map(f => {
-				try {
-					const raw = JSON.parse(readFileSync(join(ARCHIVE_DIR, f), "utf8"));
-					return {
-						name: raw.name || f,
-						goal: raw.goal || "",
-						tasks: Array.isArray(raw.tasks) ? raw.tasks.length : 0,
-						done: Array.isArray(raw.tasks) ? raw.tasks.filter((t: any) => t.status === "done").length : 0,
-						completedAt: raw.completedAt || null,
-					};
-				} catch { return null; }
-			})
-			.filter(Boolean)
-			.sort((a: any, b: any) => (b.completedAt || 0) - (a.completedAt || 0))
-			.slice(0, limit) as any[];
+		// Try index first
+		const index = readJSON<{ version: 1; entries: any[] } | null>(ARCHIVE_INDEX_PATH, null);
+		if (index && Array.isArray(index.entries)) {
+			return index.entries.slice(0, limit).map((e: any) => ({
+				name: e.name || "?",
+				goal: e.goal || "",
+				tasks: e.taskCount || 0,
+				done: e.doneCount || 0,
+				completedAt: e.completedAt || null,
+			}));
+		}
+		// Fallback: rebuild index from archive files
+		rebuildArchiveIndex();
+		const rebuilt = readJSON<{ version: 1; entries: any[] }>(ARCHIVE_INDEX_PATH, { version: 1, entries: [] });
+		return rebuilt.entries.slice(0, limit).map((e: any) => ({
+			name: e.name || "?",
+			goal: e.goal || "",
+			tasks: e.taskCount || 0,
+			done: e.doneCount || 0,
+			completedAt: e.completedAt || null,
+		}));
 	} catch { return []; }
 }
 
@@ -524,15 +628,129 @@ function formatQuestStatus(quest: Quest): string {
 	return lines.join("\n");
 }
 
-/** Build a todo-style list from quest tasks for pi-todo sync. */
-function questToTodoItems(quest: Quest): { content: string; status: string }[] {
-	return quest.tasks.map((t, i) => ({
-		content: `[Quest] #${i + 1} ${t.content}`,
-		status: t.status === "running" ? "in_progress" : t.status === "done" ? "completed" : t.status === "failed" ? "completed" : "pending",
-	}));
+type SyncedTodoStatus = "pending" | "in_progress" | "completed" | "delegated";
+
+interface SyncedTodoItem {
+	content: string;
+	status: SyncedTodoStatus;
+	agent?: string;
+	context?: string;
+	result?: string;
+	source?: string;
+	sourceId?: string;
+	sourceIndex?: number;
+	createdAt: number;
+	completedAt: number | null;
+}
+
+interface SyncedTodoList {
+	cwd: string;
+	title?: string;
+	items: SyncedTodoItem[];
+	version: 1;
+}
+
+function todoPath(cwd: string): string {
+	return join(AGENT_DIR, "tmp", "todos", `${cwdHash(cwd)}.json`);
+}
+
+function questTaskToTodo(quest: Quest, task: QuestTask, index: number, previous?: SyncedTodoItem): SyncedTodoItem {
+	const now = Date.now();
+	const failed = task.status === "failed";
+	const completed = task.status === "done" || task.status === "skipped" || failed;
+	const status: SyncedTodoStatus = task.status === "running"
+		? "in_progress"
+		: completed
+			? "completed"
+			: "pending";
+	const result = failed
+		? `[failed] ${task.result ?? task.verifyResult ?? "Task failed"}`
+		: task.result ?? undefined;
+
+	return {
+		content: `[Quest] #${index + 1} ${task.content}`,
+		status,
+		agent: task.agent,
+		context: task.context,
+		result,
+		source: "quest",
+		sourceId: quest.name,
+		sourceIndex: index,
+		createdAt: previous?.createdAt ?? task.startedAt ?? now,
+		completedAt: completed ? (previous?.completedAt ?? task.completedAt ?? now) : null,
+	};
+}
+
+function syncQuestToTodo(quest: Quest, cwd: string): void {
+	try {
+		const path = todoPath(cwd);
+		const existing = readJSON<SyncedTodoList>(path, { cwd, items: [], version: 1 });
+		const existingItems = Array.isArray(existing.items) ? existing.items : [];
+		const previousQuestItems = new Map<number, SyncedTodoItem>();
+		for (const item of existingItems) {
+			if (item?.source === "quest" && typeof item.sourceIndex === "number") {
+				previousQuestItems.set(item.sourceIndex, item);
+			}
+		}
+		const nonQuestItems = existingItems.filter(item => item?.source !== "quest" && !item?.content?.startsWith("[Quest]"));
+		const questItems = quest.tasks.map((task, index) => questTaskToTodo(quest, task, index, previousQuestItems.get(index)));
+		const next: SyncedTodoList = {
+			cwd: existing.cwd ?? cwd,
+			title: existing.title ?? `Quest: ${quest.name}`,
+			items: [...nonQuestItems, ...questItems],
+			version: 1,
+		};
+		writeJSON(path, next);
+	} catch { /* optional — pi-todo may not be installed */ }
+}
+
+function compactAwarenessBlock(cwd: string): string {
+	try {
+		const memory = loadProjectMemory(cwd);
+		const todo = readJSON<SyncedTodoList | null>(todoPath(cwd), null);
+		const meta = readJSON<any>(SESSION_META_PATH, { extensions: {} });
+		const memoryMeta = meta.extensions?.memory ?? {};
+		const todoMeta = meta.extensions?.todo ?? {};
+		const lines: string[] = [];
+
+		const language = memory?.language ?? memoryMeta.language;
+		const framework = memory?.framework ?? memoryMeta.framework;
+		const packageManager = memory?.packageManager ?? memoryMeta.packageManager;
+		const conventions = Array.isArray(memory?.conventions) ? memory.conventions.slice(0, 5) : [];
+		const tech = [language, framework, packageManager].filter(Boolean).join(" • ");
+		if (memory || tech || conventions.length) {
+			lines.push(`Memory: ${memory?.name ?? memoryMeta.name ?? basename(cwd)}${tech ? ` (${tech})` : ""}`);
+			if (conventions.length) lines.push(`Conventions: ${conventions.join("; ")}${memory?.conventions?.length > conventions.length ? "…" : ""}`);
+		}
+
+		const items = Array.isArray(todo?.items) ? todo.items : [];
+		const total = typeof todoMeta.total === "number" ? todoMeta.total : items.length;
+		if (total > 0) {
+			const completed = typeof todoMeta.completed === "number" ? todoMeta.completed : items.filter(i => i.status === "completed").length;
+			const inProgress = typeof todoMeta.inProgress === "number" ? todoMeta.inProgress : items.filter(i => i.status === "in_progress").length;
+			const delegated = typeof todoMeta.delegated === "number" ? todoMeta.delegated : items.filter(i => i.status === "delegated").length;
+			lines.push(`Todo: ${completed}/${total} done${inProgress ? ` · ${inProgress} active` : ""}${delegated ? ` · ${delegated} delegated` : ""}`);
+		}
+
+		const block = lines.length ? `\n\n## Project Awareness\n${lines.join("\n")}` : "";
+		return block.length > 800 ? `${block.slice(0, 797)}...` : block;
+	} catch { return ""; }
 }
 
 // ── Status badge ─────────────────────────────────────────────────────────────
+
+function writeQuestSessionMeta(cwd: string, quest: Quest | null): void {
+	if (!quest || quest.status === "idle" || quest.status === "done") {
+		writeSessionMeta("quest", cwd, { status: "idle", done: 0, total: 0 });
+		return;
+	}
+	writeSessionMeta("quest", cwd, {
+		name: quest.name,
+		status: quest.status,
+		done: quest.tasks.filter(t => t.status === "done").length,
+		total: quest.tasks.length,
+	});
+}
 
 function renderStatus(ctx: ExtensionContext, quest: Quest | null) {
 	const theme = (ctx.ui as any).theme;
@@ -550,7 +768,7 @@ function renderStatus(ctx: ExtensionContext, quest: Quest | null) {
 
 // ── Auto-pilot injection ─────────────────────────────────────────────────────
 
-function buildSteeringMessage(quest: Quest, task: QuestTask, index: number): string {
+function buildSteeringMessage(quest: Quest, task: QuestTask, index: number, cwd: string): string {
 	const done = quest.tasks.filter(t => t.status === "done").length;
 	const total = quest.tasks.length;
 
@@ -565,6 +783,7 @@ function buildSteeringMessage(quest: Quest, task: QuestTask, index: number): str
 		`**Use subagent:** \`${task.agent}\``,
 		`**Context:** ${task.context}`,
 		deps ? `**Depends on:** ${deps}` : "",
+		compactAwarenessBlock(cwd),
 		``,
 		`When complete, call **quest_update** with task index ${index} to mark it done.`,
 		`If you hit a blocker you can't resolve, call quest_update with status "failed" and explain why.`,
@@ -619,10 +838,13 @@ export default function (pi: ExtensionAPI) {
 			saveQuest(quest);
 			questCache = quest;
 			renderStatus(ctx, quest);
+			writeQuestSessionMeta(ctx.cwd, quest);
+			syncQuestToTodo(quest, ctx.cwd);
 
 			const modeNote = params.planningMode === "approve"
 				? `\n⚠ **Approval mode** — after the plan is created, it must be approved with **quest_approve** before execution begins.`
 				: "";
+			const awareness = compactAwarenessBlock(ctx.cwd);
 			return {
 				content: [{
 					type: "text",
@@ -632,6 +854,7 @@ export default function (pi: ExtensionAPI) {
 						`Next: Plan the quest. Use subagent(agent="scout") to explore the codebase,`,
 						`then subagent(agent="planner") to create a task breakdown. Save the plan`,
 						`with **quest_plan** — pass the tasks array and set autoStart: true.`,
+						awareness,
 						modeNote,
 					].filter(Boolean).join("\n"),
 				}],
@@ -718,12 +941,8 @@ export default function (pi: ExtensionAPI) {
 			saveQuest(quest);
 			questCache = quest;
 			renderStatus(ctx, quest);
-
-			// Sync to pi-todo if the todo_write tool is available
-			try {
-				const todoItems = questToTodoItems(quest);
-				// The agent will pick up the todo sync from the output message
-			} catch { /* optional integration */ }
+			writeQuestSessionMeta(ctx.cwd, quest);
+			syncQuestToTodo(quest, ctx.cwd);
 
 			const tasksPreview = quest.tasks.slice(0, 5).map((t, i) =>
 				`  ${i + 1}. ${t.content} [${t.agent}]${t.dependencies.length ? ` ← #${t.dependencies.map(d => d + 1).join(", #")}` : ""}`
@@ -819,6 +1038,8 @@ export default function (pi: ExtensionAPI) {
 					saveQuest(quest);
 					questCache = quest;
 					renderStatus(ctx, quest);
+					writeQuestSessionMeta(ctx.cwd, quest);
+					syncQuestToTodo(quest, ctx.cwd);
 
 					const done = quest.tasks.filter(t => t.status === "done").length;
 					const next = nextPendingTask(quest);
@@ -863,6 +1084,8 @@ export default function (pi: ExtensionAPI) {
 					saveQuest(quest);
 					questCache = quest;
 					renderStatus(ctx, quest);
+					writeQuestSessionMeta(ctx.cwd, quest);
+					syncQuestToTodo(quest, ctx.cwd);
 
 					return {
 						content: [{
@@ -889,6 +1112,8 @@ export default function (pi: ExtensionAPI) {
 				saveQuest(quest);
 				questCache = quest;
 				renderStatus(ctx, quest);
+				writeQuestSessionMeta(ctx.cwd, quest);
+				syncQuestToTodo(quest, ctx.cwd);
 
 				return {
 					content: [{
@@ -918,6 +1143,8 @@ export default function (pi: ExtensionAPI) {
 					saveQuest(quest);
 					questCache = quest;
 					renderStatus(ctx, quest);
+					writeQuestSessionMeta(ctx.cwd, quest);
+					syncQuestToTodo(quest, ctx.cwd);
 
 					const verifierAgent = team?.members.find(m => m.agent === "verifier" || m.role === "tester")?.agent ?? "verifier";
 					return {
@@ -982,6 +1209,8 @@ export default function (pi: ExtensionAPI) {
 			saveQuest(quest);
 			questCache = quest;
 			renderStatus(ctx, quest);
+			writeQuestSessionMeta(ctx.cwd, quest);
+			syncQuestToTodo(quest, ctx.cwd);
 
 			const done = quest.tasks.filter(t => t.status === "done").length;
 			const total = quest.tasks.length;
@@ -1062,6 +1291,8 @@ export default function (pi: ExtensionAPI) {
 			saveQuest(quest);
 			questCache = quest;
 			renderStatus(ctx, quest);
+			writeQuestSessionMeta(ctx.cwd, quest);
+			syncQuestToTodo(quest, ctx.cwd);
 
 			const next = nextPendingTask(quest);
 			return {
@@ -1092,6 +1323,7 @@ export default function (pi: ExtensionAPI) {
 				return { content: [{ type: "text", text: "No active quest. Create one with quest_create or /quest create." }], details: {} };
 			}
 			renderStatus(ctx, quest);
+			writeQuestSessionMeta(ctx.cwd, quest);
 			return { content: [{ type: "text", text: formatQuestStatus(quest) }], details: { quest } };
 		},
 	});
@@ -1136,6 +1368,8 @@ export default function (pi: ExtensionAPI) {
 			saveQuest(quest);
 			questCache = quest;
 			renderStatus(ctx, quest);
+			writeQuestSessionMeta(ctx.cwd, quest);
+			syncQuestToTodo(quest, ctx.cwd);
 
 			return {
 				content: [{
@@ -1302,6 +1536,8 @@ export default function (pi: ExtensionAPI) {
 					saveQuest(quest);
 					questCache = quest;
 					renderStatus(ctx, quest);
+					writeQuestSessionMeta(ctx.cwd, quest);
+					syncQuestToTodo(quest, ctx.cwd);
 
 					autoPilotLocked = true;
 					pi.sendUserMessage(
@@ -1330,10 +1566,13 @@ export default function (pi: ExtensionAPI) {
 			if (allDone && !anyFailed) {
 				quest.status = "done";
 				quest.completedAt = Date.now();
+				syncConventionsToMemory(quest, ctx.cwd);
 				archiveQuest(quest);
 				saveQuest(quest);
 				questCache = quest;
 				renderStatus(ctx, quest);
+				writeQuestSessionMeta(ctx.cwd, quest);
+				syncQuestToTodo(quest, ctx.cwd);
 
 				const git = quest.gitIntegration;
 				const gitSection = (quest.commits.length > 0)
@@ -1359,8 +1598,7 @@ export default function (pi: ExtensionAPI) {
 						`${quest.tasks.filter(t => t.status === "done").length}/${quest.tasks.length} tasks done.`,
 						gitSection,
 						``,
-						`Save any conventions you discovered to **memory_project**.`,
-						`Example: memory_project(convention="uses JWT auth middleware pattern")`,
+						quest.conventions.length ? `Saved ${quest.conventions.length} convention(s) to project memory.` : `No quest conventions to save to project memory.`,
 						``,
 						`Start a new quest with /quest create, or review with quest_history.`,
 					].filter(Boolean).join("\n"),
@@ -1373,6 +1611,8 @@ export default function (pi: ExtensionAPI) {
 				saveQuest(quest);
 				questCache = quest;
 				renderStatus(ctx, quest);
+				writeQuestSessionMeta(ctx.cwd, quest);
+				syncQuestToTodo(quest, ctx.cwd);
 
 				autoPilotLocked = true;
 				pi.sendUserMessage(
@@ -1394,6 +1634,8 @@ export default function (pi: ExtensionAPI) {
 				saveQuest(quest);
 				questCache = quest;
 				renderStatus(ctx, quest);
+				writeQuestSessionMeta(ctx.cwd, quest);
+				syncQuestToTodo(quest, ctx.cwd);
 			}
 			return;
 		}
@@ -1407,6 +1649,8 @@ export default function (pi: ExtensionAPI) {
 				saveQuest(quest);
 				questCache = quest;
 				renderStatus(ctx, quest);
+				writeQuestSessionMeta(ctx.cwd, quest);
+				syncQuestToTodo(quest, ctx.cwd);
 
 				autoPilotLocked = true;
 				pi.sendUserMessage(
@@ -1429,6 +1673,8 @@ export default function (pi: ExtensionAPI) {
 			saveQuest(quest);
 			questCache = quest;
 			renderStatus(ctx, quest);
+			writeQuestSessionMeta(ctx.cwd, quest);
+			syncQuestToTodo(quest, ctx.cwd);
 			// Don't return — retry with the next pending task
 			// This will trigger agent_end again, which will find the next task
 			return;
@@ -1443,6 +1689,8 @@ export default function (pi: ExtensionAPI) {
 			saveQuest(quest);
 			questCache = quest;
 			renderStatus(ctx, quest);
+			writeQuestSessionMeta(ctx.cwd, quest);
+			syncQuestToTodo(quest, ctx.cwd);
 
 			autoPilotLocked = true;
 			pi.sendUserMessage(
@@ -1462,10 +1710,12 @@ export default function (pi: ExtensionAPI) {
 		saveQuest(quest);
 		questCache = quest;
 		renderStatus(ctx, quest);
+		writeQuestSessionMeta(ctx.cwd, quest);
+		syncQuestToTodo(quest, ctx.cwd);
 
 		autoPilotLocked = true;
 		pi.sendUserMessage(
-			buildSteeringMessage(quest, next.task, next.index),
+			buildSteeringMessage(quest, next.task, next.index, ctx.cwd),
 			{ deliverAs: "steer", triggerTurn: true },
 		);
 		autoPilotLocked = false;
@@ -1476,6 +1726,8 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => {
 		questCache = loadQuest();
 		renderStatus(ctx, questCache);
+		writeQuestSessionMeta(ctx.cwd, questCache);
+		if (questCache?.status === "active") syncQuestToTodo(questCache, ctx.cwd);
 
 		// Notify about active quest
 		if (questCache?.status === "active") {
@@ -1498,6 +1750,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("model_select", async (_event, ctx) => {
 		renderStatus(ctx, questCache);
+		writeQuestSessionMeta(ctx.cwd, questCache);
 	});
 
 	// ── Commands ──────────────────────────────────────────────────────────────
@@ -1539,6 +1792,8 @@ export default function (pi: ExtensionAPI) {
 					saveQuest(quest);
 					questCache = quest;
 					renderStatus(ctx, quest);
+					writeQuestSessionMeta(ctx.cwd, quest);
+					syncQuestToTodo(quest, ctx.cwd);
 
 					ctx.ui.notify(
 						`Quest created: "${name}"\n\nPlan it with quest_plan or let the agent explore and plan.\n/quest start when ready.`,
@@ -1551,6 +1806,7 @@ export default function (pi: ExtensionAPI) {
 						[
 							`## New Quest: ${name}`,
 							goal ? `**Goal:** ${goal}` : "",
+							compactAwarenessBlock(ctx.cwd),
 							``,
 							`Plan this quest. Use subagent(agent="scout") to explore the codebase,`,
 							`then subagent(agent="planner") to create a task breakdown.`,
@@ -1670,6 +1926,8 @@ export default function (pi: ExtensionAPI) {
 					saveQuest(quest);
 					questCache = quest;
 					renderStatus(ctx, quest);
+					writeQuestSessionMeta(ctx.cwd, quest);
+					syncQuestToTodo(quest, ctx.cwd);
 
 					ctx.ui.notify(`Quest "${quest.name}" started — ${quest.tasks.length} tasks. Auto-pilot engaged.`, "info");
 					return;
@@ -1687,6 +1945,8 @@ export default function (pi: ExtensionAPI) {
 					saveQuest(quest);
 					questCache = quest;
 					renderStatus(ctx, quest);
+					writeQuestSessionMeta(ctx.cwd, quest);
+					syncQuestToTodo(quest, ctx.cwd);
 					ctx.ui.notify(`Quest "${quest.name}" paused. /quest resume to continue.`, "info");
 					return;
 				}
@@ -1704,6 +1964,8 @@ export default function (pi: ExtensionAPI) {
 					saveQuest(quest);
 					questCache = quest;
 					renderStatus(ctx, quest);
+					writeQuestSessionMeta(ctx.cwd, quest);
+					syncQuestToTodo(quest, ctx.cwd);
 
 					const done = quest.tasks.filter(t => t.status === "done").length;
 					const next = nextPendingTask(quest);
@@ -1737,6 +1999,8 @@ export default function (pi: ExtensionAPI) {
 					saveQuest(quest);
 					questCache = quest;
 					renderStatus(ctx, quest);
+					writeQuestSessionMeta(ctx.cwd, quest);
+					syncQuestToTodo(quest, ctx.cwd);
 
 					const next = nextPendingTask(quest);
 					ctx.ui.notify(

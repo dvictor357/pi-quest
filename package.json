@@ -1,7 +1,7 @@
 {
   "name": "pi-quest",
-  "version": "1.0.0",
-  "description": "Proactive AI project manager for pi — give it a goal and it plans, delegates, verifies, and pushes forward autonomously with sub-agent orchestration",
+  "version": "1.2.0",
+  "description": "Proactive AI project manager for pi — give it a goal and it plans, delegates, verifies, and pushes forward autonomously with sub-agent orchestration — enhanced: direct todo/memory sync, memory-aware steering, session-meta, archive manifest, cohesion contract",
   "keywords": ["pi-package"],
   "license": "MIT",
   "pi": {
