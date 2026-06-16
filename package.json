@@ -1,7 +1,7 @@
 {
   "name": "pi-quest",
-  "version": "1.5.1",
-  "description": "Proactive AI project manager for pi — give it a goal and it plans, delegates, verifies, and pushes forward autonomously with sub-agent orchestration — v1.5: modular extension architecture (10 files), split from 2776-line monolith into types, constants, utils, storage, teams, kanban, todo-sync, status, steering",
+  "version": "1.6.0",
+  "description": "Proactive AI project manager for pi — give it a goal and it plans, delegates, verifies, and pushes forward autonomously with sub-agent orchestration — v1.6: per-project storage, security hardening, error logging, cycle detection, UX polish",
   "keywords": ["pi-package"],
   "license": "MIT",
   "pi": {
