@@ -128,6 +128,7 @@ export default function (pi: ExtensionAPI) {
 				: "";
 
 			const quest = emptyQuest(params.name, params.goal, undefined, params.planningMode ?? "auto", params.verifyOnComplete ?? true, params.gitIntegration);
+			quest.cwd = ctx.cwd;
 			validateAndSetTeam(quest, params.team);
 			saveQuest(quest);
 			questCache = quest;
@@ -1668,21 +1669,21 @@ export default function (pi: ExtensionAPI) {
 				`Quest paused: ${questCache.name} — ${questCache.pauseReason ?? "/quest resume to continue"}`,
 				"warning",
 			);
-		} else if (questCache?.status === "planning") {
-				ctx.ui.notify(
-					`Quest planning: ${questCache.name} — ${questCache.tasks.length} tasks. /quest start or quest_plan to continue.`,
-					"info",
-				);
-			} else if (questCache?.status === "done") {
-				const done = questCache.tasks.filter(t => t.status === "done").length;
-				ctx.ui.notify(
-					`Quest completed: ${questCache.name} — ${done}/${questCache.tasks.length} tasks done.`,
-					"info",
-				);
-			} else if (questCache?.planningMode === "approve" && !questCache.planApproved && questCache.tasks.length > 0) {
+		} else if (questCache?.planningMode === "approve" && !questCache.planApproved && questCache.tasks.length > 0) {
 			ctx.ui.notify(
 				`Quest awaiting approval: ${questCache.name} — ${questCache.tasks.length} tasks planned. /quest approve to start.`,
 				"warning",
+			);
+		} else if (questCache?.status === "planning") {
+			ctx.ui.notify(
+				`Quest planning: ${questCache.name} — ${questCache.tasks.length} tasks. /quest start or quest_plan to continue.`,
+				"info",
+			);
+		} else if (questCache?.status === "done") {
+			const done = questCache.tasks.filter(t => t.status === "done").length;
+			ctx.ui.notify(
+				`Quest completed: ${questCache.name} — ${done}/${questCache.tasks.length} tasks done.`,
+				"info",
 			);
 		}
 	});
@@ -1744,6 +1745,7 @@ export default function (pi: ExtensionAPI) {
 					}
 
 					const quest = emptyQuest(name, goal || name);
+					quest.cwd = ctx.cwd;
 					saveQuest(quest);
 					questCache = quest;
 					renderStatus(ctx, quest);

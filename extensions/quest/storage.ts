@@ -24,6 +24,7 @@ export function emptyQuest(name: string, goal: string, team?: string, planningMo
 		name,
 		goal,
 		status: "planning",
+		cwd: undefined,
 		tasks: [],
 		tasksSincePause: 0,
 		lastFiredTaskIndex: -1,

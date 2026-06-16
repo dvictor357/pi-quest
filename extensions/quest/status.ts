@@ -3,7 +3,7 @@ import type { Quest } from "./types";
 import { writeSessionMeta } from "./utils";
 
 export function writeQuestSessionMeta(cwd: string, quest: Quest | null): void {
-	if (!quest || quest.status === "idle" || quest.status === "done") {
+	if (!quest || quest.status === "idle" || quest.status === "done" || quest.cwd !== cwd) {
 		writeSessionMeta("quest", cwd, { status: "idle", done: 0, total: 0 });
 		return;
 	}
@@ -17,7 +17,7 @@ export function writeQuestSessionMeta(cwd: string, quest: Quest | null): void {
 
 export function renderStatus(ctx: ExtensionContext, quest: Quest | null) {
 	const theme = (ctx.ui as any).theme;
-	if (!quest || quest.status === "idle" || quest.status === "done") {
+	if (!quest || quest.status === "idle" || quest.status === "done" || quest.cwd !== ctx.cwd) {
 		ctx.ui.setStatus?.("quest", "");
 		return;
 	}
