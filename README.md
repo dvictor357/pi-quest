@@ -31,6 +31,12 @@ After each agent turn, Quest checks for pending tasks. If found, it injects a **
 
 During the planning phase, Quest instructs agents to research the latest information online using `web_search` and save findings with `quest_memory_save`. The current UTC date/time is injected into every planning and steering context so agents can search for the most recent and relevant information. Saved research is surfaced in future awareness blocks across all quests.
 
+### Loop Engineering model
+
+Quest is designed as a **Loop Engineering runtime**: `plan → act → verify → decide → record → continue/stop`. The goal is not just to prompt agents, but to run a bounded feedback loop with persistent state, verifier agents, deterministic checks, retry limits, and human escalation.
+
+See [Loop Engineering for pi-quest](docs/loop-engineering.md) for the implementation direction and roadmap.
+
 ### Safety guards
 
 | Guard | Behavior |
