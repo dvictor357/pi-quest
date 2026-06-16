@@ -1,7 +1,7 @@
 {
   "name": "pi-quest",
-  "version": "1.3.0",
-  "description": "Proactive AI project manager for pi — give it a goal and it plans, delegates, verifies, and pushes forward autonomously with sub-agent orchestration — v1.3: interactive user prompts (confirm/select) for plan approval, checkpoints, stall/failure/verification decisions + quest_decide tool for branch resolution",
+  "version": "1.4.0",
+  "description": "Proactive AI project manager for pi — give it a goal and it plans, delegates, verifies, and pushes forward autonomously with sub-agent orchestration — v1.4: interactive kanban board overlay (/quest) with columns for TODO/DOING/DONE/FAILED, keyboard navigation, theme-aware styling",
   "keywords": ["pi-package"],
   "license": "MIT",
   "pi": {
