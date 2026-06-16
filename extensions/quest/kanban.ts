@@ -9,30 +9,32 @@ export class QuestKanban {
 	private selectedRow = 0;
 	private cachedWidth?: number;
 	private cachedLines?: string[];
-	private lastUpdatedAt = 0;
+	private cachedColumns?: ReturnType<QuestKanban["columns"]>;
 	public onClose?: () => void;
 
 	constructor(quest: Quest, theme: any) {
 		this.quest = quest;
 		this.theme = theme;
-		this.lastUpdatedAt = quest.updatedAt;
 	}
 
 	/** Update the quest reference (e.g. after external changes). */
 	setQuest(quest: Quest): void {
 		this.quest = quest;
-		this.lastUpdatedAt = quest.updatedAt;
+		this.cachedColumns = undefined;
 		this.invalidate();
 	}
 
 	private columns(): { title: string; tasks: QuestTask[]; color: string }[] {
-		const tasks = this.quest.tasks;
-		return [
-			{ title: "TODO", tasks: tasks.filter(t => t.status === "pending"), color: "muted" },
-			{ title: "DOING", tasks: tasks.filter(t => t.status === "running" || t.status === "verifying"), color: "accent" },
-			{ title: "DONE", tasks: tasks.filter(t => t.status === "done"), color: "success" },
-			{ title: "FAILED", tasks: tasks.filter(t => t.status === "failed" || t.status === "skipped"), color: "error" },
-		];
+		if (!this.cachedColumns) {
+			const tasks = this.quest.tasks;
+			this.cachedColumns = [
+				{ title: "TODO", tasks: tasks.filter(t => t.status === "pending"), color: "muted" },
+				{ title: "DOING", tasks: tasks.filter(t => t.status === "running" || t.status === "verifying"), color: "accent" },
+				{ title: "DONE", tasks: tasks.filter(t => t.status === "done"), color: "success" },
+				{ title: "FAILED", tasks: tasks.filter(t => t.status === "failed" || t.status === "skipped"), color: "error" },
+			];
+		}
+		return this.cachedColumns;
 	}
 
 	handleInput(data: string): void {
@@ -52,21 +54,16 @@ export class QuestKanban {
 		}
 	}
 
-	private formatTaskCell(task: QuestTask, colWidth: number): string {
-		const idx = this.quest.tasks.indexOf(task);
+	private formatTaskCell(task: QuestTask, index: number, colWidth: number): string {
 		const maxContent = colWidth - 5;
 		const content = task.content.length > maxContent
 			? task.content.slice(0, maxContent - 1) + "…"
 			: task.content;
-		return ` ${ICON[task.status]}#${idx + 1} ${content}`;
+		return ` ${ICON[task.status]}#${index + 1} ${content}`;
 	}
 
 	render(width: number): string[] {
-		// Auto-detect external quest changes (e.g. task added/updated by another turn)
-		if (this.quest.updatedAt !== this.lastUpdatedAt) {
-			this.lastUpdatedAt = this.quest.updatedAt;
-			this.invalidate();
-		}
+		this.cachedColumns = undefined;
 		if (this.cachedLines && this.cachedWidth === width) return this.cachedLines;
 
 		const theme = this.theme;
@@ -110,7 +107,7 @@ export class QuestKanban {
 			const rowParts = cols.map((c, ci) => {
 				const task = c.tasks[r];
 				const isSelected = ci === this.selectedCol && r === this.selectedRow;
-				let cell = task ? this.formatTaskCell(task, colWidth) : "";
+				let cell = task ? this.formatTaskCell(task, this.quest.tasks.indexOf(task), colWidth) : "";
 				cell = cell.padEnd(colWidth).slice(0, colWidth);
 				if (isSelected && task) {
 					return theme.bg("selectedBg", theme.fg("text", cell));
@@ -134,5 +131,6 @@ export class QuestKanban {
 	invalidate(): void {
 		this.cachedWidth = undefined;
 		this.cachedLines = undefined;
+		this.cachedColumns = undefined;
 	}
 }

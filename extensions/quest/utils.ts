@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { MEMORY_PROJECTS_DIR, SESSION_META_PATH } from "./constants";
+import { MEMORY_PROJECTS_DIR, SESSION_META_PATH, ERROR_LOG_PATH } from "./constants";
 
 export function cwdHash(cwd: string): string {
 	return createHash("sha256").update(cwd).digest("hex").slice(0, 16);
@@ -10,7 +10,7 @@ export function cwdHash(cwd: string): string {
 export function readJSON<T>(path: string, fallback: T): T {
 	try {
 		if (existsSync(path)) return JSON.parse(readFileSync(path, "utf8"));
-	} catch { /* corrupt → fallback */ }
+	} catch (e) { console.error("[pi-quest] readJSON:", e); /* corrupt → fallback */ }
 	return fallback;
 }
 
@@ -18,7 +18,7 @@ export function writeJSON(path: string, data: unknown): void {
 	try {
 		mkdirSync(dirname(path), { recursive: true });
 		writeFileSync(path, `${JSON.stringify(data, null, 2)}\n`, "utf8");
-	} catch { /* best-effort */ }
+	} catch (e) { console.error("[pi-quest] writeJSON:", e); /* best-effort */ }
 }
 
 export function projectMemoryPath(cwd: string): string {
@@ -43,8 +43,14 @@ export function writeSessionMeta(key: "memory" | "todo" | "quest", cwd: string, 
 			},
 		};
 		writeJSON(SESSION_META_PATH, next);
-	} catch { /* best-effort cross-extension metadata */ }
+	} catch (e) { console.error("[pi-quest] writeSessionMeta:", e); /* best-effort cross-extension metadata */ }
 }
 
-// join is needed for projectMemoryPath but imported from "node:path" already above via dirname
-// Actually we need to import join
+// ── Telemetry ────────────────────────────────────────────────────────────────
+
+export function logError(context: string, error: unknown): void {
+	try {
+		const line = `[${new Date().toISOString()}] ${context}: ${(error as Error)?.message || String(error)}\n`;
+		appendFileSync(ERROR_LOG_PATH, line, "utf8");
+	} catch { /* best-effort telemetry */ }
+}

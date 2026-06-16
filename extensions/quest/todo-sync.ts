@@ -14,7 +14,7 @@ export function questTaskToTodo(quest: Quest, task: QuestTask, index: number, pr
 	const now = Date.now();
 	const failed = task.status === "failed";
 	const completed = task.status === "done" || task.status === "skipped" || failed;
-	const status: SyncedTodoItem["status"] = task.status === "running"
+	const status: SyncedTodoItem["status"] = task.status === "running" || task.status === "verifying"
 		? "in_progress"
 		: completed
 			? "completed"
@@ -57,7 +57,7 @@ export function syncQuestToTodo(quest: Quest, cwd: string): void {
 			version: 1,
 		};
 		writeJSON(path, next);
-	} catch { /* optional — pi-todo may not be installed */ }
+	} catch (e) { console.error("[pi-quest] syncQuestToTodo:", e); /* optional — pi-todo may not be installed */ }
 }
 
 export function compactAwarenessBlock(cwd: string): string {
@@ -108,5 +108,5 @@ export function compactAwarenessBlock(cwd: string): string {
 
 		const block = lines.length ? `\n\n## Project Awareness\n${lines.join("\n")}` : "";
 		return block.length > 1200 ? `${block.slice(0, 1197)}...` : block;
-	} catch { return ""; }
+	} catch (e) { console.error("[pi-quest] compactAwarenessBlock:", e); return ""; }
 }

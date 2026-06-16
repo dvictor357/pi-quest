@@ -39,6 +39,58 @@ export default function (pi: ExtensionAPI) {
 		}
 	}
 
+	function detectDependencyCycle(tasks: { dependencies: number[] }[]): number[] | null {
+		const n = tasks.length;
+		const visited = new Array(n).fill(0); // 0=unvisited, 1=visiting, 2=done
+		const path: number[] = [];
+
+		function dfs(i: number): number[] | null {
+			if (visited[i] === 1) {
+				// Found cycle — extract the cycle portion
+				const cycleStart = path.indexOf(i);
+				return path.slice(cycleStart).concat(i);
+			}
+			if (visited[i] === 2) return null;
+			visited[i] = 1;
+			path.push(i);
+			for (const dep of (tasks[i]?.dependencies ?? [])) {
+				const result = dfs(dep);
+				if (result) return result;
+			}
+			path.pop();
+			visited[i] = 2;
+			return null;
+		}
+
+		for (let i = 0; i < n; i++) {
+			const result = dfs(i);
+			if (result) return result;
+		}
+		return null;
+	}
+
+	function getMaxDependencyDepth(tasks: { dependencies: number[] }[]): number {
+		const n = tasks.length;
+		const memo = new Array<number>(n).fill(-1);
+		function depth(i: number, visited: Set<number>): number {
+			if (memo[i] !== -1) return memo[i];
+			if (visited.has(i)) return 0; // cycle handled separately
+			visited.add(i);
+			let max = 0;
+			for (const dep of (tasks[i]?.dependencies ?? [])) {
+				max = Math.max(max, 1 + depth(dep, visited));
+			}
+			visited.delete(i);
+			memo[i] = max;
+			return max;
+		}
+		let result = 0;
+		for (let i = 0; i < n; i++) {
+			result = Math.max(result, depth(i, new Set()));
+		}
+		return result;
+	}
+
 	// ── Tools ────────────────────────────────────────────────────────────────
 
 	pi.registerTool({
@@ -70,6 +122,11 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 
+			const existing = getQuest();
+			const overwriteWarning = existing && existing.status !== "active"
+				? `\n⚠ Replacing existing quest "${existing.name}" (status: ${existing.status}). Previous quest will be archived on completion.`
+				: "";
+
 			const quest = emptyQuest(params.name, params.goal, undefined, params.planningMode ?? "auto", params.verifyOnComplete ?? true, params.gitIntegration);
 			validateAndSetTeam(quest, params.team);
 			saveQuest(quest);
@@ -86,7 +143,7 @@ export default function (pi: ExtensionAPI) {
 				content: [{
 					type: "text",
 					text: [
-						`Quest created: **${params.name}**`,
+						`Quest created: **${params.name}**${overwriteWarning}`,
 						``,
 						`Next: Plan the quest. Use subagent(agent="scout") to explore the codebase,`,
 						`then subagent(agent="planner") to create a task breakdown. Save the plan`,
@@ -218,6 +275,24 @@ export default function (pi: ExtensionAPI) {
 						};
 					}
 				}
+			}
+
+			// Detect dependency cycles
+			const cyclePath = detectDependencyCycle(quest.tasks);
+			if (cyclePath) {
+				return {
+					content: [{ type: "text", text: `Dependency cycle detected: ${cyclePath.map(i => `#${i + 1}`).join(" → ")}. Break the cycle to proceed.` }],
+					details: {},
+				};
+			}
+
+			// Enforce max dependency depth
+			const depth = getMaxDependencyDepth(quest.tasks);
+			if (depth > MAX_DEPENDENCY_DEPTH) {
+				return {
+					content: [{ type: "text", text: `Dependency depth ${depth} exceeds maximum ${MAX_DEPENDENCY_DEPTH}. Simplify the dependency chain.` }],
+					details: {},
+				};
 			}
 
 			const needsApproval = quest.planningMode === "approve" && !quest.planApproved;
@@ -697,6 +772,14 @@ export default function (pi: ExtensionAPI) {
 					if (edit.dependencies !== undefined) task.dependencies = edit.dependencies;
 					editsApplied++;
 				}
+				// Re-validate all dependencies after edits
+				for (let i = 0; i < quest.tasks.length; i++) {
+					for (const dep of quest.tasks[i].dependencies) {
+						if (dep < 0 || dep >= quest.tasks.length || dep === i) {
+							return { content: [{ type: "text", text: `Invalid dependency after edit in task #${i + 1}: task #${dep + 1} is out of range or self-referencing.` }], details: {} };
+						}
+					}
+				}
 			}
 
 			if (ctx.hasUI) {
@@ -1038,12 +1121,93 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+	// ── Additional tools ────────────────────────────────────────────────────
+
+	pi.registerTool({
+		name: "quest_abort",
+		label: "Quest Abort",
+		description: "Permanently archive the current quest and clear it. Only works when quest is not actively running (paused, planning, or done).",
+		parameters: Type.Object({}),
+		async execute(_id, _params, _signal, _onUpdate, ctx) {
+			const quest = getQuest();
+			if (!quest) {
+				return { content: [{ type: "text", text: "No active quest to abort." }], details: {} };
+			}
+			if (quest.status === "active") {
+				return { content: [{ type: "text", text: "Cannot abort an active quest. Pause it first with /quest pause." }], details: {} };
+			}
+			const name = quest.name;
+			const done = quest.tasks.filter(t => t.status === "done").length;
+			const total = quest.tasks.length;
+			if (quest.status !== "done") {
+				quest.status = "done";
+				quest.completedAt = Date.now();
+				archiveQuest(quest);
+			}
+			questCache = null;
+			renderStatus(ctx, null);
+			writeQuestSessionMeta(ctx.cwd, null);
+			return {
+				content: [{ type: "text", text: `Quest "${name}" aborted and archived (${done}/${total} tasks done).` }],
+				details: { name, done, total },
+			};
+		},
+	});
+
+	pi.registerTool({
+		name: "quest_task_detail",
+		label: "Quest Task Detail",
+		description: "Get full details for a specific task including context, result, attempts, timing, and verification status.",
+		parameters: Type.Object({
+			index: Type.Number({ description: "Task index (0-based)" }),
+		}),
+		async execute(_id, params, _signal, _onUpdate, _ctx) {
+			const quest = getQuest();
+			if (!quest) {
+				return { content: [{ type: "text", text: "No active quest." }], details: {} };
+			}
+			if (params.index < 0 || params.index >= quest.tasks.length) {
+				return { content: [{ type: "text", text: `Invalid task index ${params.index}. Valid: 0-${quest.tasks.length - 1}.` }], details: {} };
+			}
+			const t = quest.tasks[params.index];
+			const deps = t.dependencies.length
+				? t.dependencies.map(d => `#${d + 1} ${quest.tasks[d].content}`).join(", ")
+				: "none";
+			const time = t.startedAt
+				? `${Math.round(((t.completedAt ?? Date.now()) - t.startedAt) / 1000)}s`
+				: "not started";
+			const lines = [
+				`## Task #${params.index + 1}: ${t.content}`,
+				``,
+				`**Status:** ${t.status}  |  **Agent:** ${t.agent}  |  **Attempts:** ${t.attempts}`,
+				`**Dependencies:** ${deps}`,
+				`**Timing:** ${time}${t.completedAt ? ` (completed)` : ""}`,
+				``,
+				`**Context:**`,
+				t.context,
+			];
+			if (t.result) {
+				lines.push(``, `**Result:**`, t.result);
+			}
+			if (t.verified) {
+				lines.push(``, `**Verification:** ✅ ${t.verifyResult || "passed"}`);
+			} else if (t.status === "verifying") {
+				lines.push(``, `**Verification:** 🔍 in progress (retries: ${t.verifyRetries})`);
+			}
+			if (t.commitHash) {
+				lines.push(``, `**Commit:** \`${t.commitHash.slice(0, 8)}\`${t.branchName ? ` on ${t.branchName}` : ""}`);
+			}
+			return { content: [{ type: "text", text: lines.join("\n") }], details: { task: t, index: params.index } };
+		},
+	});
+
 	// ── Auto-pilot ────────────────────────────────────────────────────────────
 
 	pi.on("agent_end", async (_event, ctx) => {
 		if (autoPilotLocked) return;
-		const quest = getQuest();
-		if (!quest || quest.status !== "active") return;
+		try {
+			const quest = getQuest();
+			if (!quest || quest.status !== "active") return;
 
 		const next = nextPendingTask(quest);
 		if (!next) {
@@ -1066,21 +1230,24 @@ export default function (pi: ExtensionAPI) {
 
 						if (action === "Verify them now (agent will handle it)") {
 							autoPilotLocked = true;
-							pi.sendUserMessage(
-								[
-									`## Verification Pending ⏳`,
-									``,
-									`${verifyingTasks.length} task(s) awaiting verification:`,
-									verifyingTasks.map(t => {
-										const idx = quest.tasks.indexOf(t);
-										return `- #${idx + 1} **${t.content}** — Use subagent(agent="verifier") then call quest_update(index=${idx}, verifyOutcome="PASS"|"FAIL", verifyEvidence=...)`;
-									}).join("\n"),
-									``,
-									`After resolving verification, /quest resume.`,
-								].join("\n"),
-								{ deliverAs: "steer", triggerTurn: true },
-							);
-							autoPilotLocked = false;
+							try {
+								pi.sendUserMessage(
+									[
+										`## Verification Pending ⏳`,
+										``,
+										`${verifyingTasks.length} task(s) awaiting verification:`,
+										verifyingTasks.map(t => {
+											const idx = quest.tasks.indexOf(t);
+											return `- #${idx + 1} **${t.content}** — Use subagent(agent="verifier") then call quest_update(index=${idx}, verifyOutcome="PASS"|"FAIL", verifyEvidence=...)`;
+										}).join("\n"),
+										``,
+										`After resolving verification, /quest resume.`,
+									].join("\n"),
+									{ deliverAs: "steer", triggerTurn: true },
+								);
+							} finally {
+								autoPilotLocked = false;
+							}
 							return;
 						}
 
@@ -1115,21 +1282,39 @@ export default function (pi: ExtensionAPI) {
 						ctx.ui.notify(`Quest paused: ${verifyingTasks.length} task(s) need verification.\n${vfyList}`, "warning");
 					} else {
 						autoPilotLocked = true;
-						pi.sendUserMessage(
-							[
-								`## Verification Pending ⏳`,
-								``,
-								`${verifyingTasks.length} task(s) awaiting verification:`,
-								verifyingTasks.map(t => {
-									const idx = quest.tasks.indexOf(t);
-									return `- #${idx + 1} **${t.content}** — call quest_update(index=${idx}, verifyOutcome="PASS"|"FAIL", verifyEvidence=...)`;
-								}).join("\n"),
-								``,
-								`/quest resume after resolving verification.`,
-							].join("\n"),
-							{ deliverAs: "steer", triggerTurn: true },
-						);
-						autoPilotLocked = false;
+						try {
+							pi.sendUserMessage(
+								[
+									`## Verification Pending ⏳`,
+									``,
+									`${verifyingTasks.length} task(s) awaiting verification:`,
+									verifyingTasks.map(t => {
+										const idx = quest.tasks.indexOf(t);
+										return `- #${idx + 1} **${t.content}** — call quest_update(index=${idx}, verifyOutcome="PASS"|"FAIL", verifyEvidence=...)`;
+									}).join("\n"),
+									``,
+									`/quest resume after resolving verification.`,
+								].join("\n"),
+								{ deliverAs: "steer", triggerTurn: true },
+							);
+						} finally {
+							autoPilotLocked = false;
+						}
+					}
+					return;
+				} else {
+					// allResolved is false — some tasks pending because deps are verifying
+					quest.status = "paused";
+					quest.pauseReason = `Verification pending on ${verifyingTasks.length} task(s): ${verifyingTasks.map(t => t.content).join(", ")}. Complete verification to unblock dependent tasks.`;
+					quest.lastFiredTaskIndex = -1;
+					quest.sameTaskCount = 0;
+					saveQuest(quest);
+					questCache = quest;
+					renderStatus(ctx, quest);
+					writeQuestSessionMeta(ctx.cwd, quest);
+					syncQuestToTodo(quest, ctx.cwd);
+					if (ctx.hasUI) {
+						ctx.ui.notify(`Quest paused: ${verifyingTasks.length} task(s) need verification before dependents can proceed.\n${vfyList}`, "warning");
 					}
 					return;
 				}
@@ -1166,20 +1351,23 @@ export default function (pi: ExtensionAPI) {
 					: (git?.autoCommit ? `\n\n⚠ No commits were recorded for this quest. Use quest_commit to track deliverables.` : "");
 
 				autoPilotLocked = true;
-				pi.sendUserMessage(
-					[
-						`## Quest Complete: ${quest.name} 🎉`,
-						``,
-						`${quest.tasks.filter(t => t.status === "done").length}/${quest.tasks.length} tasks done.`,
-						gitSection,
-						``,
-						quest.conventions.length ? `Saved ${quest.conventions.length} convention(s) to project memory.` : `No quest conventions to save to project memory.`,
-						``,
-						`Start a new quest with /quest create, or review with quest_history.`,
-					].filter(Boolean).join("\n"),
-					{ deliverAs: "steer", triggerTurn: true },
-				);
-				autoPilotLocked = false;
+				try {
+					pi.sendUserMessage(
+						[
+							`## Quest Complete: ${quest.name} 🎉`,
+							``,
+							`${quest.tasks.filter(t => t.status === "done").length}/${quest.tasks.length} tasks done.`,
+							gitSection,
+							``,
+							quest.conventions.length ? `Saved ${quest.conventions.length} convention(s) to project memory.` : `No quest conventions to save to project memory.`,
+							``,
+							`Start a new quest with /quest create, or review with quest_history.`,
+						].filter(Boolean).join("\n"),
+						{ deliverAs: "steer", triggerTurn: true },
+					);
+				} finally {
+					autoPilotLocked = false;
+				}
 			} else if (anyFailed) {
 				const failedTasks = quest.tasks.filter(t => t.status === "failed");
 				const failedList = failedTasks.map(t => {
@@ -1250,18 +1438,21 @@ export default function (pi: ExtensionAPI) {
 					ctx.ui.notify(`Quest paused: ${failedTasks.length} task(s) failed.\nFailed:\n${failedList}`, "warning");
 				} else {
 					autoPilotLocked = true;
-					pi.sendUserMessage(
-						[
-							`## Quest Paused: ${quest.name} ⚠`,
-							``,
-							`Some tasks failed. Review the status with quest_status and decide next steps:`,
-							`- Fix the issue and call quest_update to retry`,
-							`- Skip failed tasks with quest_update(status="skipped")`,
-							`- /quest resume to continue`,
-						].join("\n"),
-						{ deliverAs: "steer", triggerTurn: true },
-					);
-					autoPilotLocked = false;
+					try {
+						pi.sendUserMessage(
+							[
+								`## Quest Paused: ${quest.name} ⚠`,
+								``,
+								`Some tasks failed. Review the status with quest_status and decide next steps:`,
+								`- Fix the issue and call quest_update to retry`,
+								`- Skip failed tasks with quest_update(status="skipped")`,
+								`- /quest resume to continue`,
+							].join("\n"),
+							{ deliverAs: "steer", triggerTurn: true },
+						);
+					} finally {
+						autoPilotLocked = false;
+					}
 				}
 			} else {
 				quest.status = "paused";
@@ -1330,11 +1521,14 @@ export default function (pi: ExtensionAPI) {
 					ctx.ui.notify(`Quest paused: stalled task. /quest resume to continue.`, "warning");
 				} else {
 					autoPilotLocked = true;
-					pi.sendUserMessage(
-						`## Quest Paused: Stalled ⚠\n\nTask #${next.index + 1} "${next.task.content}" has been attempted ${quest.sameTaskCount} times without completion.\nUse quest_update to mark it failed or skipped, then /quest resume.`,
-						{ deliverAs: "steer", triggerTurn: true },
-					);
-					autoPilotLocked = false;
+					try {
+						pi.sendUserMessage(
+							`## Quest Paused: Stalled ⚠\n\nTask #${next.index + 1} "${next.task.content}" has been attempted ${quest.sameTaskCount} times without completion.\nUse quest_update to mark it failed or skipped, then /quest resume.`,
+							{ deliverAs: "steer", triggerTurn: true },
+						);
+					} finally {
+						autoPilotLocked = false;
+					}
 				}
 				return;
 			}
@@ -1405,11 +1599,14 @@ export default function (pi: ExtensionAPI) {
 				syncQuestToTodo(quest, ctx.cwd);
 
 				autoPilotLocked = true;
-				pi.sendUserMessage(
-					`## Quest Paused: Checkpoint ⏸\n\n${quest.tasksSincePause}/${MAX_BURST} tasks completed. Progress:\n${formatQuestStatus(quest)}\n\n/quest resume to continue.`,
-					{ deliverAs: "steer", triggerTurn: true },
-				);
-				autoPilotLocked = false;
+				try {
+					pi.sendUserMessage(
+						`## Quest Paused: Checkpoint ⏸\n\n${quest.tasksSincePause}/${MAX_BURST} tasks completed. Progress:\n${formatQuestStatus(quest)}\n\n/quest resume to continue.`,
+						{ deliverAs: "steer", triggerTurn: true },
+					);
+				} finally {
+					autoPilotLocked = false;
+				}
 				return;
 			}
 		}
@@ -1427,11 +1624,30 @@ export default function (pi: ExtensionAPI) {
 		syncQuestToTodo(quest, ctx.cwd);
 
 		autoPilotLocked = true;
-		pi.sendUserMessage(
-			buildSteeringMessage(quest, next.task, next.index, ctx.cwd),
-			{ deliverAs: "steer", triggerTurn: true },
-		);
-		autoPilotLocked = false;
+		try {
+			pi.sendUserMessage(
+				buildSteeringMessage(quest, next.task, next.index, ctx.cwd),
+				{ deliverAs: "steer", triggerTurn: true },
+			);
+		} finally {
+			autoPilotLocked = false;
+		}
+		} catch (e) {
+			console.error("[pi-quest] agent_end handler crashed:", e);
+			const quest = getQuest();
+			if (quest) {
+				quest.status = "paused";
+				quest.pauseReason = `Auto-pilot error: ${(e as Error)?.message || String(e)}`;
+				saveQuest(quest);
+				questCache = quest;
+			}
+			renderStatus(ctx, quest);
+			writeQuestSessionMeta(ctx.cwd, quest);
+			if (quest) syncQuestToTodo(quest, ctx.cwd);
+			if (ctx.hasUI) {
+				ctx.ui.notify(`Quest auto-pilot error: ${(e as Error)?.message || String(e)}. Quest paused.`, "error");
+			}
+		}
 	});
 
 	// ── Lifecycle ─────────────────────────────────────────────────────────────
@@ -1452,7 +1668,18 @@ export default function (pi: ExtensionAPI) {
 				`Quest paused: ${questCache.name} — ${questCache.pauseReason ?? "/quest resume to continue"}`,
 				"warning",
 			);
-		} else if (questCache?.planningMode === "approve" && !questCache.planApproved && questCache.tasks.length > 0) {
+		} else if (questCache?.status === "planning") {
+				ctx.ui.notify(
+					`Quest planning: ${questCache.name} — ${questCache.tasks.length} tasks. /quest start or quest_plan to continue.`,
+					"info",
+				);
+			} else if (questCache?.status === "done") {
+				const done = questCache.tasks.filter(t => t.status === "done").length;
+				ctx.ui.notify(
+					`Quest completed: ${questCache.name} — ${done}/${questCache.tasks.length} tasks done.`,
+					"info",
+				);
+			} else if (questCache?.planningMode === "approve" && !questCache.planApproved && questCache.tasks.length > 0) {
 			ctx.ui.notify(
 				`Quest awaiting approval: ${questCache.name} — ${questCache.tasks.length} tasks planned. /quest approve to start.`,
 				"warning",
@@ -1468,7 +1695,7 @@ export default function (pi: ExtensionAPI) {
 	// ── Commands ──────────────────────────────────────────────────────────────
 
 	pi.registerCommand("quest", {
-		description: "Quest: proactive AI project manager. /quest create|start|pause|resume|approve|kanban|status|history|git|team [list|create]",
+		description: "Quest: proactive AI project manager. /quest create|start|pause|resume|approve|cancel|kanban|status|history|git|team [list|create]",
 		handler: async (args, ctx) => {
 			const trimmed = args.trim();
 			const spaceIdx = trimmed.indexOf(" ");
@@ -1529,21 +1756,24 @@ export default function (pi: ExtensionAPI) {
 					);
 
 					autoPilotLocked = true;
-					pi.sendUserMessage(
-						[
-							`## New Quest: ${name}`,
-							goal ? `**Goal:** ${goal}` : "",
-							compactAwarenessBlock(ctx.cwd),
+					try {
+						pi.sendUserMessage(
+							[
+								`## New Quest: ${name}`,
+								goal ? `**Goal:** ${goal}` : "",
+								compactAwarenessBlock(ctx.cwd),
+								``,
+								`Plan this quest. Use subagent(agent="scout") to explore the codebase,`,
+								`then subagent(agent="planner") to create a task breakdown.`,
+								`Save the plan with **quest_plan(tasks=[...], autoStart=true)**.`,
 							``,
-							`Plan this quest. Use subagent(agent="scout") to explore the codebase,`,
-							`then subagent(agent="planner") to create a task breakdown.`,
-							`Save the plan with **quest_plan(tasks=[...], autoStart=true)**.`,
-						``,
-						`Research: Note the current date. Use web_search to find the latest relevant information about this goal (best practices, APIs, security considerations, etc.). Save key findings with quest_memory_save.`,
-						].filter(Boolean).join("\n"),
-						{ deliverAs: "steer", triggerTurn: true },
-					);
-					autoPilotLocked = false;
+							`Research: Note the current date. Use web_search to find the latest relevant information about this goal (best practices, APIs, security considerations, etc.). Save key findings with quest_memory_save.`,
+							].filter(Boolean).join("\n"),
+							{ deliverAs: "steer", triggerTurn: true },
+						);
+					} finally {
+						autoPilotLocked = false;
+					}
 					return;
 				}
 				case "team": {
@@ -1635,6 +1865,10 @@ export default function (pi: ExtensionAPI) {
 						ctx.ui.notify("No quest created. /quest create first.", "error");
 						return;
 					}
+					if (quest.status === "active") {
+						ctx.ui.notify("Quest is already active.", "info");
+						return;
+					}
 					if (quest.tasks.length === 0) {
 						ctx.ui.notify("No tasks planned. Use quest_plan to add tasks first.", "error");
 						return;
@@ -1718,6 +1952,9 @@ export default function (pi: ExtensionAPI) {
 						return;
 					}
 
+					const planSummary = quest.tasks.slice(0, 8).map((t, i) => `${i + 1}. ${t.content} [${t.agent}]`).join("\n");
+					const moreTasks = quest.tasks.length > 8 ? `\n  … and ${quest.tasks.length - 8} more` : "";
+
 					quest.planApproved = true;
 					quest.status = "active";
 					quest.tasksSincePause = 0;
@@ -1732,7 +1969,7 @@ export default function (pi: ExtensionAPI) {
 
 					const next = nextPendingTask(quest);
 					ctx.ui.notify(
-						`✅ Plan approved: "${quest.name}" — ${quest.tasks.length} tasks. Auto-pilot engaged.${next ? ` First: ${next.task.content}` : ""}`,
+						`✅ Plan approved: "${quest.name}" — ${quest.tasks.length} tasks. Auto-pilot engaged.${next ? ` First: ${next.task.content}` : ""}\n\n${planSummary}${moreTasks}`,
 						"info",
 					);
 					return;
@@ -1817,9 +2054,33 @@ export default function (pi: ExtensionAPI) {
 					ctx.ui.notify(`Completed quests:\n\n${lines.join("\n\n")}`, "info");
 					return;
 				}
+				case "cancel": {
+					const quest = getQuest();
+					if (!quest) {
+						ctx.ui.notify("No active quest to cancel.", "info");
+						return;
+					}
+					if (quest.status === "active") {
+						ctx.ui.notify("Cannot cancel an active quest. /quest pause first.", "error");
+						return;
+					}
+					const name = quest.name;
+					const done = quest.tasks.filter(t => t.status === "done").length;
+					if (quest.status !== "done") {
+						quest.status = "done";
+						quest.completedAt = Date.now();
+						archiveQuest(quest);
+					}
+					questCache = null;
+					renderStatus(ctx, null);
+					writeQuestSessionMeta(ctx.cwd, null);
+					syncQuestToTodo(quest, ctx.cwd);
+					ctx.ui.notify(`Quest "${name}" cancelled and archived (${done}/${quest.tasks.length} tasks done).`, "info");
+					return;
+				}
 				default:
 					ctx.ui.notify(
-						"Usage: /quest [create <name>: <goal>|start|pause|resume|approve|kanban|status|history|git|team [list|install <url>|create]]",
+						"Usage: /quest [create <name>: <goal>|start|pause|resume|approve|cancel|kanban|status|history|git|team [list|install <url>|create]]",
 						"error",
 					);
 			}

@@ -6,7 +6,10 @@ export function nextPendingTask(quest: Quest): { task: QuestTask; index: number 
 	for (let i = 0; i < quest.tasks.length; i++) {
 		const t = quest.tasks[i];
 		if (t.status !== "pending") continue;
-		const allDepsMet = t.dependencies.every(d => quest.tasks[d]?.status === "done");
+		const allDepsMet = t.dependencies.every(d => {
+			const s = quest.tasks[d]?.status;
+			return s === "done" || s === "skipped";
+		});
 		if (!allDepsMet) continue;
 		return { task: t, index: i };
 	}

@@ -15,7 +15,7 @@ export function syncConventionsToMemory(quest: Quest, cwd: string): void {
 		const conventions = Array.isArray(existing.conventions) ? existing.conventions : [];
 		const merged = [...new Set([...conventions, ...quest.conventions])];
 		writeJSON(projectMemoryPath(cwd), { ...existing, conventions: merged, lastModified: Date.now() });
-	} catch { /* optional — pi-memory may not be installed */ }
+	} catch (e) { console.error("[pi-quest] syncConventionsToMemory:", e); /* optional — pi-memory may not be installed */ }
 }
 
 export function emptyQuest(name: string, goal: string, team?: string, planningMode: "auto" | "approve" = "auto", verifyOnComplete = true, gitIntegration?: Quest["gitIntegration"]): Quest {
@@ -75,9 +75,34 @@ export function loadQuest(): Quest | null {
 			if (!raw.commits || !Array.isArray(raw.commits)) {
 				raw.commits = [];
 			}
+			if (!raw.researchFindings || !Array.isArray(raw.researchFindings)) {
+				raw.researchFindings = [];
+			}
+			if (!raw.gitIntegration || typeof raw.gitIntegration !== "object") {
+				raw.gitIntegration = { autoCommit: true, autoBranch: true, autoPR: false, branchPrefix: "quest/" };
+			}
+			if (raw.team !== undefined && typeof raw.team !== "string") {
+				raw.team = undefined;
+			}
+			if (typeof raw.createdAt !== "number") {
+				raw.createdAt = Date.now();
+			}
+			if (typeof raw.updatedAt !== "number") {
+				raw.updatedAt = Date.now();
+			}
+			if (!raw.conventions || !Array.isArray(raw.conventions)) {
+				raw.conventions = [];
+			}
+			const validStatuses: string[] = ["planning", "active", "paused", "done", "idle"];
+			if (!validStatuses.includes(raw.status)) {
+				raw.status = "idle";
+			}
+			if (typeof raw.tasksSincePause !== "number") raw.tasksSincePause = 0;
+			if (typeof raw.lastFiredTaskIndex !== "number") raw.lastFiredTaskIndex = -1;
+			if (typeof raw.sameTaskCount !== "number") raw.sameTaskCount = 0;
 			return raw as Quest;
 		}
-	} catch { /* corrupt */ }
+	} catch (e) { console.error("[pi-quest] loadQuest:", e); /* corrupt */ }
 	return null;
 }
 
@@ -101,7 +126,7 @@ export function archiveQuest(quest: Quest): string | null {
 			doneCount: quest.tasks.filter(t => t.status === "done").length,
 		});
 		return path;
-	} catch { return null; }
+	} catch (e) { console.error("[pi-quest] archiveQuest:", e); return null; }
 }
 
 function updateArchiveIndex(entry: { path: string; name: string; goal: string; completedAt: number; taskCount: number; doneCount: number }): void {
@@ -111,7 +136,7 @@ function updateArchiveIndex(entry: { path: string; name: string; goal: string; c
 		index.entries.push(entry);
 		index.entries.sort((a: any, b: any) => (b.completedAt || 0) - (a.completedAt || 0));
 		writeJSON(ARCHIVE_INDEX_PATH, index);
-	} catch { /* best-effort */ }
+	} catch (e) { console.error("[pi-quest] updateArchiveIndex:", e); /* best-effort */ }
 }
 
 export function rebuildArchiveIndex(): void {
@@ -131,11 +156,11 @@ export function rebuildArchiveIndex(): void {
 					taskCount: Array.isArray(raw.tasks) ? raw.tasks.length : 0,
 					doneCount: Array.isArray(raw.tasks) ? raw.tasks.filter((t: any) => t.status === "done").length : 0,
 				});
-			} catch { /* skip corrupt */ }
+			} catch (e) { console.error("[pi-quest] rebuildArchiveIndex/read:", e); /* skip corrupt */ }
 		}
 		entries.sort((a: any, b: any) => (b.completedAt || 0) - (a.completedAt || 0));
 		writeJSON(ARCHIVE_INDEX_PATH, { version: 1, entries });
-	} catch { /* best-effort */ }
+	} catch (e) { console.error("[pi-quest] rebuildArchiveIndex:", e); /* best-effort */ }
 }
 
 export function listArchives(limit: number): { name: string; goal: string; tasks: number; done: number; completedAt: number | null }[] {
@@ -160,5 +185,5 @@ export function listArchives(limit: number): { name: string; goal: string; tasks
 			done: e.doneCount || 0,
 			completedAt: e.completedAt || null,
 		}));
-	} catch { return []; }
+	} catch (e) { console.error("[pi-quest] listArchives:", e); return []; }
 }

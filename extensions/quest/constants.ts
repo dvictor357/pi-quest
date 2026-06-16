@@ -14,6 +14,7 @@ export const MEMORY_PROJECTS_DIR = join(AGENT_DIR, "memory", "projects");
 export const SESSION_META_PATH = join(AGENT_DIR, "session-meta.json");
 export const ARCHIVE_INDEX_PATH = join(ARCHIVE_DIR, "archive-index.json");
 export const TEAMS_DIR = join(AGENT_DIR, "quests", "teams");
+export const ERROR_LOG_PATH = join(AGENT_DIR, "quests", "error.log");
 
 export const ICON: Record<TaskStatus, string> = {
 	pending: "☐",

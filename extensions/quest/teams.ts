@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync, rmSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
-import { execSync } from "node:child_process";
+import { basename, join } from "node:path";
+import { execFileSync } from "node:child_process";
 import { readJSON, writeJSON } from "./utils";
 import type { TeamConfig } from "./types";
 import { TEAMS_DIR, BUILT_IN_TEAMS } from "./constants";
@@ -17,17 +17,22 @@ export function loadTeams(): Record<string, TeamConfig> {
 				if (raw && raw.name) {
 					teams[raw.name] = raw as TeamConfig;
 				}
-			} catch { /* skip corrupt files */ }
+			} catch (e) { console.error("[pi-quest] loadTeams/read:", e); /* skip corrupt files */ }
 		}
 		return teams;
-	} catch { return {}; }
+	} catch (e) { console.error("[pi-quest] loadTeams:", e); return {}; }
 }
+
+const SAFE_TEAM_NAME = /^[a-z0-9_-]+$/i;
 
 export function saveTeam(team: TeamConfig): void {
 	try {
+		if (!SAFE_TEAM_NAME.test(team.name)) {
+			throw new Error(`Invalid team name: "${team.name}". Use only letters, numbers, hyphens, and underscores.`);
+		}
 		mkdirSync(TEAMS_DIR, { recursive: true });
 		writeFileSync(join(TEAMS_DIR, `${team.name}.json`), `${JSON.stringify(team, null, 2)}\n`, "utf8");
-	} catch { /* best-effort */ }
+	} catch (e) { console.error("[pi-quest] saveTeam:", e); /* best-effort */ }
 }
 
 export function ensureBuiltInTeams(): void {
@@ -38,15 +43,15 @@ export function ensureBuiltInTeams(): void {
 				saveTeam(BUILT_IN_TEAMS[key]);
 			}
 		}
-	} catch { /* best-effort */ }
+	} catch (e) { console.error("[pi-quest] ensureBuiltInTeams:", e); /* best-effort */ }
 }
 
 export function teamInstallFromGit(url: string): { success: boolean; team?: TeamConfig; error?: string } {
 	const tmpDir = join(homedir(), ".pi", "agent", "quests", "teams", ".tmp");
 	try {
-		try { rmSync(tmpDir, { recursive: true, force: true }); } catch { /* ok */ }
+		try { rmSync(tmpDir, { recursive: true, force: true }); } catch (e) { console.error("[pi-quest] teamInstallFromGit/pre-cleanup:", e); /* ok */ }
 
-		const cloneOutput = execSync(`git clone --depth 1 "${url}" "${tmpDir}"`, {
+		const cloneOutput = execFileSync("git", ["clone", "--depth", "1", url, tmpDir], {
 			encoding: "utf8",
 			timeout: 30000,
 			stdio: ["pipe", "pipe", "pipe"],
@@ -87,8 +92,9 @@ export function teamInstallFromGit(url: string): { success: boolean; team?: Team
 				name: a.name || "",
 				description: a.description || "",
 				markdown: a.markdown || a.file ? (() => {
-					const mdPath = join(tmpDir, a.file || `${a.name}.md`);
-					try { return readFileSync(mdPath, "utf8"); } catch { return a.markdown || ""; }
+					const safeFile = a.file ? basename(a.file) : `${a.name}.md`;
+					const mdPath = join(tmpDir, safeFile);
+					try { return readFileSync(mdPath, "utf8"); } catch (e) { console.error("[pi-quest] teamInstallFromGit/agent-md:", e); return a.markdown || ""; }
 				})() : "",
 			}));
 		}
@@ -107,8 +113,9 @@ export function teamInstallFromGit(url: string): { success: boolean; team?: Team
 
 		return { success: true, team };
 	} catch (e: any) {
+		console.error("[pi-quest] teamInstallFromGit:", e);
 		return { success: false, error: e?.message || String(e) };
 	} finally {
-		try { rmSync(tmpDir, { recursive: true, force: true }); } catch { /* cleanup */ }
+		try { rmSync(tmpDir, { recursive: true, force: true }); } catch (e) { console.error("[pi-quest] teamInstallFromGit/cleanup:", e); /* cleanup */ }
 	}
 }
