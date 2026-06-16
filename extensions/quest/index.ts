@@ -1477,7 +1477,7 @@ export default function (pi: ExtensionAPI) {
 
 			switch (sub) {
 				case "": {
-					const quest = getQuest();
+					const quest = loadQuest();
 					if (!quest) {
 						ctx.ui.notify("No active quest. Use /quest create <name>: <goal> to start.", "info");
 						return;
@@ -1487,7 +1487,11 @@ export default function (pi: ExtensionAPI) {
 							const kanban = new QuestKanban(quest, theme);
 							kanban.onClose = () => done(undefined);
 							return {
-								render: (w: number) => kanban.render(w),
+								render: (w: number) => {
+									const fresh = loadQuest();
+									if (fresh) kanban.setQuest(fresh);
+									return kanban.render(w);
+								},
 								invalidate: () => kanban.invalidate(),
 								handleInput: (data: string) => { kanban.handleInput(data); tui.requestRender(); },
 							};
@@ -1734,7 +1738,7 @@ export default function (pi: ExtensionAPI) {
 					return;
 				}
 			case "kanban": {
-				const quest = getQuest();
+				const quest = loadQuest();
 				if (!quest) {
 					ctx.ui.notify("No active quest.", "info");
 					return;
@@ -1743,8 +1747,13 @@ export default function (pi: ExtensionAPI) {
 					await ctx.ui.custom((tui, theme, _kb, done) => {
 						const kanban = new QuestKanban(quest, theme);
 						kanban.onClose = () => done(undefined);
+						// Refresh quest data on re-render so status updates are visible
 						return {
-							render: (w: number) => kanban.render(w),
+							render: (w: number) => {
+								const fresh = loadQuest();
+								if (fresh) kanban.setQuest(fresh);
+								return kanban.render(w);
+							},
 							invalidate: () => kanban.invalidate(),
 							handleInput: (data: string) => { kanban.handleInput(data); tui.requestRender(); },
 						};
@@ -1755,7 +1764,7 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 			case "status": {
-					const quest = getQuest();
+					const quest = loadQuest();
 					if (!quest) {
 						ctx.ui.notify("No active quest.", "info");
 						return;

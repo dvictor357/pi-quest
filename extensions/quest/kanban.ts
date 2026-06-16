@@ -9,11 +9,20 @@ export class QuestKanban {
 	private selectedRow = 0;
 	private cachedWidth?: number;
 	private cachedLines?: string[];
+	private lastUpdatedAt = 0;
 	public onClose?: () => void;
 
 	constructor(quest: Quest, theme: any) {
 		this.quest = quest;
 		this.theme = theme;
+		this.lastUpdatedAt = quest.updatedAt;
+	}
+
+	/** Update the quest reference (e.g. after external changes). */
+	setQuest(quest: Quest): void {
+		this.quest = quest;
+		this.lastUpdatedAt = quest.updatedAt;
+		this.invalidate();
 	}
 
 	private columns(): { title: string; tasks: QuestTask[]; color: string }[] {
@@ -53,6 +62,11 @@ export class QuestKanban {
 	}
 
 	render(width: number): string[] {
+		// Auto-detect external quest changes (e.g. task added/updated by another turn)
+		if (this.quest.updatedAt !== this.lastUpdatedAt) {
+			this.lastUpdatedAt = this.quest.updatedAt;
+			this.invalidate();
+		}
 		if (this.cachedLines && this.cachedWidth === width) return this.cachedLines;
 
 		const theme = this.theme;
