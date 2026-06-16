@@ -80,6 +80,7 @@ interface Quest {
 	verifyOnComplete: boolean;
 	gitIntegration?: GitIntegration;
 	commits: { taskIndex: number; hash: string; message: string; branch?: string; timestamp: number }[];
+	researchFindings?: { key: string; value: string; category?: string; timestamp: number }[];
 	createdAt: number;
 	completedAt: number | null;
 	updatedAt: number;
@@ -713,6 +714,9 @@ function compactAwarenessBlock(cwd: string): string {
 		const todoMeta = meta.extensions?.todo ?? {};
 		const lines: string[] = [];
 
+		const now = new Date();
+		lines.push(`Date: ${now.toLocaleString("en-US", { weekday: "short", year: "numeric", month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", timeZone: "UTC", timeZoneName: "short" })}`);
+
 		const language = memory?.language ?? memoryMeta.language;
 		const framework = memory?.framework ?? memoryMeta.framework;
 		const packageManager = memory?.packageManager ?? memoryMeta.packageManager;
@@ -721,6 +725,22 @@ function compactAwarenessBlock(cwd: string): string {
 		if (memory || tech || conventions.length) {
 			lines.push(`Memory: ${memory?.name ?? memoryMeta.name ?? basename(cwd)}${tech ? ` (${tech})` : ""}`);
 			if (conventions.length) lines.push(`Conventions: ${conventions.join("; ")}${memory?.conventions?.length > conventions.length ? "…" : ""}`);
+		}
+
+		// Research findings from project memory
+		const research = memory?.research as Record<string, { value: string; category?: string; timestamp: number }> | undefined;
+		if (research) {
+			const entries = Object.entries(research)
+				.sort(([, a], [, b]) => b.timestamp - a.timestamp)
+				.slice(0, 5);
+			if (entries.length) {
+				const lines2 = entries.map(([k, v]) => {
+					const cat = v.category ? `[${v.category}] ` : "";
+					const val = v.value.length > 80 ? v.value.slice(0, 77) + "…" : v.value;
+					return `- ${k}: ${cat}${val}`;
+				});
+				lines.push(`Research:\n${lines2.join("\n")}`);
+			}
 		}
 
 		const items = Array.isArray(todo?.items) ? todo.items : [];
@@ -733,7 +753,7 @@ function compactAwarenessBlock(cwd: string): string {
 		}
 
 		const block = lines.length ? `\n\n## Project Awareness\n${lines.join("\n")}` : "";
-		return block.length > 800 ? `${block.slice(0, 797)}...` : block;
+		return block.length > 1200 ? `${block.slice(0, 1197)}...` : block;
 	} catch { return ""; }
 }
 
@@ -854,6 +874,8 @@ export default function (pi: ExtensionAPI) {
 						`Next: Plan the quest. Use subagent(agent="scout") to explore the codebase,`,
 						`then subagent(agent="planner") to create a task breakdown. Save the plan`,
 						`with **quest_plan** — pass the tasks array and set autoStart: true.`,
+						``,
+						`Research: Note the current date. Use web_search to find the latest relevant information about this goal (best practices, APIs, security considerations, etc.). Save key findings with quest_memory_save.`,
 						awareness,
 						modeNote,
 					].filter(Boolean).join("\n"),
@@ -1749,6 +1771,77 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+	pi.registerTool({
+		name: "quest_memory_save",
+		label: "Quest Memory Save",
+		description: [
+			"Save a research finding to the current quest. If a finding with the same key exists, it is updated.",
+			"Findings are also synced to project memory (best-effort) for cross-quest awareness.",
+		].join(" "),
+		parameters: Type.Object({
+			key: Type.String({ description: "Unique key for this finding (e.g. \"api-auth\", \"best-practice-deployment\")" }),
+			value: Type.String({ description: "The research finding content" }),
+			category: Type.Optional(Type.String({ description: "Optional category for grouping (e.g. \"security\", \"performance\", \"api\")" })),
+		}),
+		async execute(_id, params, _signal, _onUpdate, ctx) {
+			const quest = getQuest();
+			if (!quest) {
+				return { content: [{ type: "text", text: "No active quest. Use quest_create first." }], details: {} };
+			}
+
+			// Initialize researchFindings if needed
+			if (!quest.researchFindings) quest.researchFindings = [];
+
+			// Upsert by key
+			const existing = quest.researchFindings.find(f => f.key === params.key);
+			const timestamp = Date.now();
+			if (existing) {
+				existing.value = params.value;
+				if (params.category !== undefined) existing.category = params.category;
+				existing.timestamp = timestamp;
+			} else {
+				quest.researchFindings.push({
+					key: params.key,
+					value: params.value,
+					category: params.category,
+					timestamp,
+				});
+			}
+
+			saveQuest(quest);
+			questCache = quest;
+			renderStatus(ctx, quest);
+			writeQuestSessionMeta(ctx.cwd, quest);
+
+			// Best-effort sync to project memory
+			try {
+				const memoryPath = projectMemoryPath(ctx.cwd);
+				const memory = readJSON<Record<string, any>>(memoryPath, {});
+				if (!memory.research) memory.research = {};
+				memory.research[params.key] = {
+					value: params.value,
+					category: params.category ?? null,
+					timestamp,
+				};
+				writeJSON(memoryPath, memory);
+			} catch { /* best-effort */ }
+
+			const action = existing ? "Updated" : "Saved";
+			return {
+				content: [{
+					type: "text",
+					text: [
+						`${action} research finding **${params.key}**`,
+						params.category ? `  Category: ${params.category}` : "",
+						``,
+						`Total findings: ${quest.researchFindings.length}`,
+					].filter(Boolean).join("\n"),
+				}],
+				details: { key: params.key, totalFindings: quest.researchFindings.length },
+			};
+		},
+	});
+
 	// ── Auto-pilot ────────────────────────────────────────────────────────────
 
 	pi.on("agent_end", async (_event, ctx) => {
@@ -2254,6 +2347,8 @@ export default function (pi: ExtensionAPI) {
 							`Plan this quest. Use subagent(agent="scout") to explore the codebase,`,
 							`then subagent(agent="planner") to create a task breakdown.`,
 							`Save the plan with **quest_plan(tasks=[...], autoStart=true)**.`,
+						``,
+						`Research: Note the current date. Use web_search to find the latest relevant information about this goal (best practices, APIs, security considerations, etc.). Save key findings with quest_memory_save.`,
 						].filter(Boolean).join("\n"),
 						{ deliverAs: "steer", triggerTurn: true },
 					);

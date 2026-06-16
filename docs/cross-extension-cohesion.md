@@ -66,6 +66,7 @@ Fields inside each extension block are optional and version-tolerant. Consumers 
 
 - Quest may write quest-derived todo items into the todo store, but must preserve non-quest todo items.
 - Quest may merge completed quest conventions into memory project conventions.
+- Quest may write research findings to memory via `quest_memory_save`, stored as `memory.research[key] = { value, category, timestamp }` — writes immediately (best-effort), not just on quest completion.
 - Todo should reload from disk when another extension updates its active file.
 - Memory should publish compact project facts for Quest steering, not large prompt blocks.
 
