@@ -864,6 +864,63 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerTool({
+		name: "quest_decide",
+		label: "Quest Decide",
+		description: [
+			"Ask the user a question during quest planning or execution.",
+			"Call this whenever the quest plan has a branch, ambiguity, or decision point",
+			"that needs human judgment — e.g. picking between approaches, confirming tradeoffs,",
+			"or resolving unknowns the agent can't determine alone.",
+			"Presents the options to the user via an interactive select dialog and returns their choice.",
+		].join(" "),
+		parameters: Type.Object({
+			question: Type.String({ description: "The decision to present to the user. Be clear about the tradeoffs." }),
+			options: Type.Array(Type.String(), { description: "List of options the user can choose from (max 10)." }),
+			context: Type.Optional(Type.String({ description: "Background context to help the user make an informed decision." })),
+		}),
+		async execute(_id, params, _signal, _onUpdate, ctx) {
+			if (!ctx.hasUI) {
+				return {
+					content: [{ type: "text", text: `Decision needed: "${params.question}" — options: ${params.options.join(", ")}. Running headlessly — defaulting to first option: "${params.options[0]}".` }],
+					details: { choice: params.options[0], index: 0, headless: true },
+				};
+			}
+
+			if (params.options.length === 0) {
+				return { content: [{ type: "text", text: "No options provided." }], details: {} };
+			}
+
+			if (params.options.length > 10) {
+				return { content: [{ type: "text", text: "Too many options (max 10). Narrow them down." }], details: {} };
+			}
+
+			const title = `Quest Decide: ${params.question.slice(0, 60)}${params.question.length > 60 ? "…" : ""}`;
+			const message = [
+				params.context ? `${params.context}\n` : "",
+				`**Question:** ${params.question}`,
+				``,
+				`Pick an option:`,
+			].filter(Boolean).join("\n");
+
+			const choice = await ctx.ui.select(message, params.options);
+			const idx = params.options.indexOf(choice);
+
+			return {
+				content: [{
+					type: "text",
+					text: [
+						`**User decided:** ${choice}`,
+						``,
+						`Question: ${params.question}`,
+						`Chosen: **${choice}** (option ${idx + 1}/${params.options.length})`,
+					].join("\n"),
+				}],
+				details: { question: params.question, choice, index: idx, options: params.options },
+			};
+		},
+	});
+
+	pi.registerTool({
 		name: "quest_plan",
 		label: "Quest Plan",
 		description: [
@@ -871,6 +928,7 @@ export default function (pi: ExtensionAPI) {
 			"Each task needs: content, agent (sub-agent type), context (focused instructions).",
 			"Optionally: dependencies (array of task indices that must complete first).",
 			"Set autoStart: true to immediately begin auto-pilot execution.",
+			"When planningMode='approve' and running interactively, shows the plan to the user for approval.",
 		].join(" "),
 		parameters: Type.Object({
 			tasks: Type.Array(Type.Object({
@@ -921,9 +979,148 @@ export default function (pi: ExtensionAPI) {
 
 			const needsApproval = quest.planningMode === "approve" && !quest.planApproved;
 
+			// ── Interactive plan review (when UI is available) ──────────────────
+			// Format plan summary once for both confirm + fallback
+			const tasksPreview = quest.tasks.slice(0, 6).map((t, i) =>
+				`${i + 1}. **${t.content}** [${t.agent}]${t.dependencies.length ? ` ← #${t.dependencies.map(d => d + 1).join(", #")}` : ""}\n   ${t.context}`
+			).join("\n\n");
+
+			const fullPlan = quest.tasks.map((t, i) => {
+				const deps = t.dependencies.length ? ` (requires: ${t.dependencies.map(d => quest.tasks[d].content).join(", ")})` : "";
+				return `${i + 1}. **${t.content}** [${t.agent}]${deps}\n   ${t.context}`;
+			}).join("\n\n");
+
+			if (needsApproval && ctx.hasUI) {
+				// Show plan and ask user to approve
+				const confirmMsg = [
+					`**Quest:** ${quest.name}`,
+					`**Goal:** ${quest.goal}`,
+					``,
+					`**${quest.tasks.length} tasks planned:**`,
+					``,
+					fullPlan,
+					``,
+					`---`,
+					`Approve this plan to start executing tasks automatically?`,
+				].join("\n");
+
+				const approved = await ctx.ui.confirm("Review Quest Plan", confirmMsg);
+
+				if (approved) {
+					// User approved — start immediately
+					quest.planApproved = true;
+					quest.status = "active";
+					quest.tasksSincePause = 0;
+					quest.lastFiredTaskIndex = -1;
+					quest.sameTaskCount = 0;
+					quest.pauseReason = null;
+
+					saveQuest(quest);
+					questCache = quest;
+					renderStatus(ctx, quest);
+					writeQuestSessionMeta(ctx.cwd, quest);
+					syncQuestToTodo(quest, ctx.cwd);
+
+					ctx.ui.notify(`✅ Plan approved. Quest "${quest.name}" is now ACTIVE — ${quest.tasks.length} tasks.`, "info");
+
+					const next = nextPendingTask(quest);
+					return {
+						content: [{
+							type: "text",
+							text: [
+								`✅ Plan approved by user: **${quest.name}**`,
+								``,
+								`${quest.tasks.length} tasks queued. Quest is now **ACTIVE**.`,
+								next ? `First task: ${next.task.content} [${next.task.agent}]` : "All tasks ready.",
+								``,
+								"Auto-pilot will fire the first task on the next turn.",
+							].join("\n"),
+						}],
+						details: { approved: true, tasks: quest.tasks.length, nextTask: next?.task.content ?? null },
+					};
+				}
+
+				// User declined — ask what to do
+				const action = await ctx.ui.select(
+					"Plan not approved. What would you like to do?",
+					["Edit tasks before approving", "Re-plan from scratch", "Cancel (keep plan for later)"],
+				);
+
+				if (action === "Edit tasks before approving") {
+					quest.status = "planning";
+					quest.pauseReason = "Plan review: user wants edits. Use quest_approve(edits=[...]) to modify tasks and approve.";
+					saveQuest(quest);
+					questCache = quest;
+					renderStatus(ctx, quest);
+					writeQuestSessionMeta(ctx.cwd, quest);
+					syncQuestToTodo(quest, ctx.cwd);
+
+					return {
+						content: [{
+							type: "text",
+							text: [
+								`📝 Plan saved but needs edits before approval.`,
+								``,
+								`Use **quest_approve(edits=[...])** to modify specific tasks, then approve.`,
+								`Or re-plan with quest_plan(tasks=[...]).`,
+								``,
+								`Tasks that can be edited:`,
+								quest.tasks.map((t, i) => `  #${i + 1}: ${t.content}`).join("\n"),
+							].join("\n"),
+						}],
+						details: { status: "planning", userAction: "edit", tasks: quest.tasks.length },
+					};
+				}
+
+				if (action === "Re-plan from scratch") {
+					quest.tasks = [];
+					quest.status = "planning";
+					quest.pauseReason = "User requested re-plan.";
+					saveQuest(quest);
+					questCache = quest;
+					renderStatus(ctx, quest);
+					writeQuestSessionMeta(ctx.cwd, quest);
+					syncQuestToTodo(quest, ctx.cwd);
+
+					return {
+						content: [{
+							type: "text",
+							text: [
+								`🔄 Plan cleared. Call **quest_plan** with a new task breakdown.`,
+								``,
+								`Original goal: ${quest.goal}`,
+							].join("\n"),
+						}],
+						details: { status: "planning", userAction: "replan" },
+					};
+				}
+
+				// Cancel — keep plan for later
+				quest.status = "planning";
+				quest.pauseReason = "Plan saved, awaiting user approval. Use /quest approve or quest_approve to start.";
+				saveQuest(quest);
+				questCache = quest;
+				renderStatus(ctx, quest);
+				writeQuestSessionMeta(ctx.cwd, quest);
+				syncQuestToTodo(quest, ctx.cwd);
+
+				return {
+					content: [{
+						type: "text",
+						text: [
+							`💾 Plan saved (${quest.tasks.length} tasks) — kept for later.`,
+							``,
+							`Approve when ready: **quest_approve()** or **/quest approve**`,
+						].join("\n"),
+					}],
+					details: { status: "planning", userAction: "defer" },
+				};
+			}
+
+			// ── No UI or auto-start: existing logic ────────────────────────────
 			if (params.autoStart !== false) {
 				if (needsApproval) {
-					// Stay in planning, wait for quest_approve
+					// Stay in planning if headless (already handled interactive)
 					quest.status = "planning";
 					quest.pauseReason = "Plan ready — awaiting approval. Use quest_approve or /quest approve to start.";
 				} else {
@@ -944,10 +1141,6 @@ export default function (pi: ExtensionAPI) {
 			writeQuestSessionMeta(ctx.cwd, quest);
 			syncQuestToTodo(quest, ctx.cwd);
 
-			const tasksPreview = quest.tasks.slice(0, 5).map((t, i) =>
-				`  ${i + 1}. ${t.content} [${t.agent}]${t.dependencies.length ? ` ← #${t.dependencies.map(d => d + 1).join(", #")}` : ""}`
-			).join("\n");
-
 			const approvalMsg = needsApproval
 				? [
 					``,
@@ -955,10 +1148,7 @@ export default function (pi: ExtensionAPI) {
 					``,
 					`## Plan Review`,
 					``,
-					quest.tasks.map((t, i) => {
-						const deps = t.dependencies.length ? ` (requires: ${t.dependencies.map(d => quest.tasks[d].content).join(", ")})` : "";
-						return `${i + 1}. **${t.content}** [${t.agent}]${deps}\n   ${t.context}`;
-					}).join("\n\n"),
+					fullPlan,
 					``,
 					`---`,
 					``,
@@ -975,7 +1165,7 @@ export default function (pi: ExtensionAPI) {
 					text: [
 						`Plan saved: **${quest.tasks.length} tasks**`,
 						``,
-						tasksPreview,
+						`  ${quest.tasks.slice(0, 5).map((t, i) => `${i + 1}. ${t.content} [${t.agent}]${t.dependencies.length ? ` ← #${t.dependencies.map(d => d + 1).join(", #")}` : ""}`).join("\n  ")}`,
 						quest.tasks.length > 5 ? `  … and ${quest.tasks.length - 5} more` : "",
 						``,
 						quest.status === "active"
@@ -1241,6 +1431,7 @@ export default function (pi: ExtensionAPI) {
 		description: [
 			"Approve the current quest plan and start execution.",
 			"Only needed when planningMode is 'approve'.",
+			"When running interactively, shows a confirmation dialog with the full plan before approving.",
 			"Optionally pass edits to modify tasks before starting.",
 		].join(" "),
 		parameters: Type.Object({
@@ -1267,6 +1458,7 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			// Apply edits if provided
+			let editsApplied = 0;
 			if (params.edits) {
 				for (const edit of params.edits) {
 					if (edit.index < 0 || edit.index >= quest.tasks.length) {
@@ -1277,6 +1469,49 @@ export default function (pi: ExtensionAPI) {
 					if (edit.agent !== undefined) task.agent = edit.agent;
 					if (edit.context !== undefined) task.context = edit.context;
 					if (edit.dependencies !== undefined) task.dependencies = edit.dependencies;
+					editsApplied++;
+				}
+			}
+
+			// Interactive confirmation (when UI available)
+			if (ctx.hasUI) {
+				const planSummary = quest.tasks.map((t, i) => {
+					const deps = t.dependencies.length ? ` (requires: ${t.dependencies.map(d => quest.tasks[d].content).join(", ")})` : "";
+					return `${i + 1}. **${t.content}** [${t.agent}]${deps}`;
+				}).join("\n");
+
+				const confirmMsg = [
+					`**Quest:** ${quest.name}`,
+					`**Goal:** ${quest.goal}`,
+					``,
+					`**${quest.tasks.length} tasks:**`,
+					planSummary,
+					``,
+					`---`,
+					editsApplied > 0 ? `${editsApplied} task(s) edited. ` : "",
+					`Start executing tasks now?`,
+				].join("\n");
+
+				const approved = await ctx.ui.confirm("Approve Quest Plan", confirmMsg);
+				if (!approved) {
+					// Save edits but stay in planning
+					saveQuest(quest);
+					questCache = quest;
+					renderStatus(ctx, quest);
+					writeQuestSessionMeta(ctx.cwd, quest);
+					syncQuestToTodo(quest, ctx.cwd);
+
+					return {
+						content: [{
+							type: "text",
+							text: [
+								editsApplied > 0 ? `📝 ${editsApplied} task edit(s) saved. Plan not approved — kept in planning.` : `Plan not approved. Kept in planning.`,
+								``,
+								`Approve when ready with **quest_approve()** or **/quest approve**.`,
+							].join("\n"),
+						}],
+						details: { approved: false, editsApplied },
+					};
 				}
 			}
 
@@ -1531,30 +1766,88 @@ export default function (pi: ExtensionAPI) {
 					t.status === "done" || t.status === "skipped" || t.status === "failed" || t.status === "verifying"
 				);
 				if (allResolved) {
+					const vfyList = verifyingTasks.map(t => {
+						const idx = quest.tasks.indexOf(t);
+						return `- #${idx + 1} **${t.content}**`;
+					}).join("\n");
+
+					if (ctx.hasUI) {
+						const action = await ctx.ui.select(
+							`${verifyingTasks.length} task(s) need verification. What now?`,
+							["Verify them now (agent will handle it)", "Skip verification for all", "Pause quest"],
+						);
+
+						if (action === "Verify them now (agent will handle it)") {
+							// Send steering message so agent runs verification
+							autoPilotLocked = true;
+							pi.sendUserMessage(
+								[
+									`## Verification Pending ⏳`,
+									``,
+									`${verifyingTasks.length} task(s) awaiting verification:`,
+									verifyingTasks.map(t => {
+										const idx = quest.tasks.indexOf(t);
+										return `- #${idx + 1} **${t.content}** — Use subagent(agent="verifier") then call quest_update(index=${idx}, verifyOutcome="PASS"|"FAIL", verifyEvidence=...)`;
+									}).join("\n"),
+									``,
+									`After resolving verification, /quest resume.`,
+								].join("\n"),
+								{ deliverAs: "steer", triggerTurn: true },
+							);
+							autoPilotLocked = false;
+							return;
+						}
+
+						if (action === "Skip verification for all") {
+							for (const t of verifyingTasks) {
+								t.status = "done";
+								t.verified = true;
+								t.verifyResult = "[SKIP] Verification skipped by user.";
+								t.completedAt = Date.now();
+							}
+							saveQuest(quest);
+							questCache = quest;
+							renderStatus(ctx, quest);
+							writeQuestSessionMeta(ctx.cwd, quest);
+							syncQuestToTodo(quest, ctx.cwd);
+							ctx.ui.notify(`${verifyingTasks.length} task(s) verified (skipped). Continuing...`, "info");
+							// agent_end will fire again and auto-complete
+							return;
+						}
+
+						// Pause — fall through
+					}
+
 					quest.status = "paused";
 					quest.pauseReason = `Waiting for verification on ${verifyingTasks.length} task(s): ${verifyingTasks.map(t => t.content).join(", ")}. Resolve with quest_update(verifyOutcome=...).`;
+					quest.lastFiredTaskIndex = -1;
+					quest.sameTaskCount = 0;
 					saveQuest(quest);
 					questCache = quest;
 					renderStatus(ctx, quest);
 					writeQuestSessionMeta(ctx.cwd, quest);
 					syncQuestToTodo(quest, ctx.cwd);
 
-					autoPilotLocked = true;
-					pi.sendUserMessage(
-						[
-							`## Verification Pending ⏳`,
-							``,
-							`${verifyingTasks.length} task(s) awaiting verification:`,
-							verifyingTasks.map((t, i) => {
-								const idx = quest.tasks.indexOf(t);
-								return `- #${idx + 1} **${t.content}** — call quest_update(index=${idx}, verifyOutcome="PASS"|"FAIL", verifyEvidence=...)`;
-							}).join("\n"),
-							``,
-							`/quest resume after resolving verification.`,
-						].join("\n"),
-						{ deliverAs: "steer", triggerTurn: true },
-					);
-					autoPilotLocked = false;
+					if (ctx.hasUI) {
+						ctx.ui.notify(`Quest paused: ${verifyingTasks.length} task(s) need verification.\n${vfyList}`, "warning");
+					} else {
+						autoPilotLocked = true;
+						pi.sendUserMessage(
+							[
+								`## Verification Pending ⏳`,
+								``,
+								`${verifyingTasks.length} task(s) awaiting verification:`,
+								verifyingTasks.map(t => {
+									const idx = quest.tasks.indexOf(t);
+									return `- #${idx + 1} **${t.content}** — call quest_update(index=${idx}, verifyOutcome="PASS"|"FAIL", verifyEvidence=...)`;
+								}).join("\n"),
+								``,
+								`/quest resume after resolving verification.`,
+							].join("\n"),
+							{ deliverAs: "steer", triggerTurn: true },
+						);
+						autoPilotLocked = false;
+					}
 					return;
 				}
 			}
@@ -1606,27 +1899,90 @@ export default function (pi: ExtensionAPI) {
 				);
 				autoPilotLocked = false;
 			} else if (anyFailed) {
+				const failedTasks = quest.tasks.filter(t => t.status === "failed");
+				const failedList = failedTasks.map(t => {
+					const i = quest.tasks.indexOf(t);
+					return `  #${i + 1}: ${t.content} — ${t.result || "no details"}`;
+				}).join("\n");
+
+				if (ctx.hasUI) {
+					const action = await ctx.ui.select(
+						`${failedTasks.length} task(s) failed. What would you like to do?`,
+						["Retry failed tasks", "Skip all failed", "Pause and review"],
+					);
+
+					if (action === "Retry failed tasks") {
+						for (const t of failedTasks) {
+							t.status = "pending";
+							t.attempts = 0;
+							t.startedAt = null;
+							t.completedAt = null;
+							t.result = null;
+						}
+						quest.status = "active";
+						quest.tasksSincePause = 0;
+						quest.lastFiredTaskIndex = -1;
+						quest.sameTaskCount = 0;
+						quest.pauseReason = null;
+						saveQuest(quest);
+						questCache = quest;
+						renderStatus(ctx, quest);
+						writeQuestSessionMeta(ctx.cwd, quest);
+						syncQuestToTodo(quest, ctx.cwd);
+						ctx.ui.notify(`${failedTasks.length} task(s) reset for retry. Auto-pilot resuming.`, "info");
+						return;
+					}
+
+					if (action === "Skip all failed") {
+						for (const t of failedTasks) {
+							t.status = "skipped";
+							t.result = `Skipped by user.`;
+							t.completedAt = Date.now();
+						}
+						quest.status = "active";
+						quest.tasksSincePause = 0;
+						quest.lastFiredTaskIndex = -1;
+						quest.sameTaskCount = 0;
+						quest.pauseReason = null;
+						saveQuest(quest);
+						questCache = quest;
+						renderStatus(ctx, quest);
+						writeQuestSessionMeta(ctx.cwd, quest);
+						syncQuestToTodo(quest, ctx.cwd);
+						ctx.ui.notify(`${failedTasks.length} task(s) skipped. Auto-pilot resuming.`, "info");
+						return;
+					}
+
+					// Pause and review — fall through
+				}
+
 				quest.status = "paused";
 				quest.pauseReason = "Some tasks failed. Review and decide: retry, skip, or redefine.";
+				quest.lastFiredTaskIndex = -1;
+				quest.sameTaskCount = 0;
 				saveQuest(quest);
 				questCache = quest;
 				renderStatus(ctx, quest);
 				writeQuestSessionMeta(ctx.cwd, quest);
 				syncQuestToTodo(quest, ctx.cwd);
 
-				autoPilotLocked = true;
-				pi.sendUserMessage(
-					[
-						`## Quest Paused: ${quest.name} ⚠`,
-						``,
-						`Some tasks failed. Review the status with quest_status and decide next steps:`,
-						`- Fix the issue and call quest_update to retry`,
-						`- Skip failed tasks with quest_update(status="skipped")`,
-						`- /quest resume to continue`,
-					].join("\n"),
-					{ deliverAs: "steer", triggerTurn: true },
-				);
-				autoPilotLocked = false;
+				if (ctx.hasUI) {
+					ctx.ui.notify(`Quest paused: ${failedTasks.length} task(s) failed.\nFailed:\n${failedList}`, "warning");
+				} else {
+					autoPilotLocked = true;
+					pi.sendUserMessage(
+						[
+							`## Quest Paused: ${quest.name} ⚠`,
+							``,
+							`Some tasks failed. Review the status with quest_status and decide next steps:`,
+							`- Fix the issue and call quest_update to retry`,
+							`- Skip failed tasks with quest_update(status="skipped")`,
+							`- /quest resume to continue`,
+						].join("\n"),
+						{ deliverAs: "steer", triggerTurn: true },
+					);
+					autoPilotLocked = false;
+				}
 			} else {
 				// All pending tasks are blocked by dependencies
 				quest.status = "paused";
@@ -1644,20 +2000,65 @@ export default function (pi: ExtensionAPI) {
 		if (next.index === quest.lastFiredTaskIndex) {
 			quest.sameTaskCount++;
 			if (quest.sameTaskCount > 2) {
+				if (ctx.hasUI) {
+					const action = await ctx.ui.select(
+						`Task "${next.task.content}" stalled after ${quest.sameTaskCount} attempts. What now?`,
+						["Skip this task", "Mark as failed", "Pause quest"],
+					);
+
+					if (action === "Skip this task") {
+						next.task.status = "skipped";
+						next.task.result = `Skipped by user after stalling (${quest.sameTaskCount} attempts).`;
+						next.task.completedAt = Date.now();
+						quest.lastFiredTaskIndex = -1;
+						quest.sameTaskCount = 0;
+						saveQuest(quest);
+						questCache = quest;
+						renderStatus(ctx, quest);
+						writeQuestSessionMeta(ctx.cwd, quest);
+						syncQuestToTodo(quest, ctx.cwd);
+						ctx.ui.notify(`Task #${next.index + 1} skipped.`, "info");
+						return;
+					}
+
+					if (action === "Mark as failed") {
+						next.task.status = "failed";
+						next.task.result = `Failed by user after stalling (${quest.sameTaskCount} attempts).`;
+						next.task.completedAt = Date.now();
+						quest.lastFiredTaskIndex = -1;
+						quest.sameTaskCount = 0;
+						saveQuest(quest);
+						questCache = quest;
+						renderStatus(ctx, quest);
+						writeQuestSessionMeta(ctx.cwd, quest);
+						syncQuestToTodo(quest, ctx.cwd);
+						ctx.ui.notify(`Task #${next.index + 1} marked failed.`, "warning");
+						return;
+					}
+
+					// Pause — fall through
+				}
+
 				quest.status = "paused";
 				quest.pauseReason = `Task #${next.index + 1} stalled (${quest.sameTaskCount} attempts without progress).`;
+				quest.lastFiredTaskIndex = -1;
+				quest.sameTaskCount = 0;
 				saveQuest(quest);
 				questCache = quest;
 				renderStatus(ctx, quest);
 				writeQuestSessionMeta(ctx.cwd, quest);
 				syncQuestToTodo(quest, ctx.cwd);
 
-				autoPilotLocked = true;
-				pi.sendUserMessage(
-					`## Quest Paused: Stalled ⚠\n\nTask #${next.index + 1} "${next.task.content}" has been attempted ${quest.sameTaskCount} times without completion.\nUse quest_update to mark it failed or skipped, then /quest resume.`,
-					{ deliverAs: "steer", triggerTurn: true },
-				);
-				autoPilotLocked = false;
+				if (ctx.hasUI) {
+					ctx.ui.notify(`Quest paused: stalled task. /quest resume to continue.`, "warning");
+				} else {
+					autoPilotLocked = true;
+					pi.sendUserMessage(
+						`## Quest Paused: Stalled ⚠\n\nTask #${next.index + 1} "${next.task.content}" has been attempted ${quest.sameTaskCount} times without completion.\nUse quest_update to mark it failed or skipped, then /quest resume.`,
+						{ deliverAs: "steer", triggerTurn: true },
+					);
+					autoPilotLocked = false;
+				}
 				return;
 			}
 		} else {
@@ -1680,25 +2081,67 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 
-		// Burst limit: auto-pause after max consecutive tasks
+		// Burst limit: ask user before continuing
 		if (quest.tasksSincePause >= MAX_BURST) {
-			quest.status = "paused";
-			quest.pauseReason = `Auto-paused after ${MAX_BURST} tasks. /quest resume to continue.`;
-			quest.lastFiredTaskIndex = -1;
-			quest.sameTaskCount = 0;
-			saveQuest(quest);
-			questCache = quest;
-			renderStatus(ctx, quest);
-			writeQuestSessionMeta(ctx.cwd, quest);
-			syncQuestToTodo(quest, ctx.cwd);
+			const done = quest.tasks.filter(t => t.status === "done").length;
+			const total = quest.tasks.length;
 
-			autoPilotLocked = true;
-			pi.sendUserMessage(
-				`## Quest Paused: Checkpoint ⏸\n\n${quest.tasksSincePause}/${MAX_BURST} tasks completed. Progress:\n${formatQuestStatus(quest)}\n\n/quest resume to continue.`,
-				{ deliverAs: "steer", triggerTurn: true },
-			);
-			autoPilotLocked = false;
-			return;
+			if (ctx.hasUI) {
+				const cont = await ctx.ui.confirm(
+					"Quest Checkpoint",
+					[`**${quest.tasksSincePause} tasks** completed in this burst.`,
+					 ``,
+					 `Progress: **${done}/${total}** done`,
+					 `Next: **${next.task.content}** [${next.task.agent}]`,
+					 ``,
+					 `Continue to next task?`,
+					].join("\n"),
+				);
+
+				if (cont) {
+					// Reset burst counter and continue
+					quest.tasksSincePause = 0;
+					quest.lastFiredTaskIndex = -1;
+					quest.sameTaskCount = 0;
+					saveQuest(quest);
+					questCache = quest;
+					renderStatus(ctx, quest);
+					writeQuestSessionMeta(ctx.cwd, quest);
+					syncQuestToTodo(quest, ctx.cwd);
+					// Fall through to fire the next task
+				} else {
+					quest.status = "paused";
+					quest.pauseReason = `User paused at checkpoint after ${quest.tasksSincePause} tasks. /quest resume to continue.`;
+					quest.lastFiredTaskIndex = -1;
+					quest.sameTaskCount = 0;
+					saveQuest(quest);
+					questCache = quest;
+					renderStatus(ctx, quest);
+					writeQuestSessionMeta(ctx.cwd, quest);
+					syncQuestToTodo(quest, ctx.cwd);
+					ctx.ui.notify(`Quest paused. /quest resume to continue.`, "info");
+					return;
+				}
+			} else {
+				// Headless: auto-pause
+				quest.status = "paused";
+				quest.pauseReason = `Auto-paused after ${MAX_BURST} tasks. /quest resume to continue.`;
+				quest.lastFiredTaskIndex = -1;
+				quest.sameTaskCount = 0;
+				saveQuest(quest);
+				questCache = quest;
+				renderStatus(ctx, quest);
+				writeQuestSessionMeta(ctx.cwd, quest);
+				syncQuestToTodo(quest, ctx.cwd);
+
+				autoPilotLocked = true;
+				pi.sendUserMessage(
+					`## Quest Paused: Checkpoint ⏸\n\n${quest.tasksSincePause}/${MAX_BURST} tasks completed. Progress:\n${formatQuestStatus(quest)}\n\n/quest resume to continue.`,
+					{ deliverAs: "steer", triggerTurn: true },
+				);
+				autoPilotLocked = false;
+				return;
+			}
 		}
 
 		// Fire the next task
