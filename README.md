@@ -8,17 +8,17 @@ Built on top of pi's sub-agent system. Quest orchestrates the entire flow: scout
 YOU: /quest create "Add user auth to the app"
          │
          ▼
-    ┌─────────────────────────────┐
+    ┌──────────────────────────────┐
     │       QUEST ORCHESTRATOR     │
-    │                             │
-    │  1. Scout explores codebase │
-    │  2. Planner creates tasks   │
-    │  3. Auto-pilot fires tasks  │
-    │     one by one via steering │
-    │  4. Agent + sub-agents work │
-    │  5. Verifier checks results │
-    │  6. Done — conventions saved│
-    └─────────────────────────────┘
+    │                              │
+    │  1. Scout explores codebase  │
+    │  2. Planner creates tasks    │
+    │  3. Auto-pilot fires tasks   │
+    │     one by one via steering  │
+    │  4. Agent + sub-agents work  │
+    │  5. Verifier checks results  │
+    │  6. Done — conventions saved │
+    └──────────────────────────────┘
 ```
 
 ## How it works
@@ -39,16 +39,16 @@ See [Loop Engineering for pi-quest](docs/loop-engineering.md) for the implementa
 
 ### Safety guards
 
-| Guard | Behavior |
-|-------|----------|
-| **Max burst** | Auto-pauses after 6 consecutive tasks — `/quest resume` to continue |
-| **Stall detection** | Same task 3 times without progress → pauses |
-| **Retry limit** | 2 retries per task, then auto-marked failed |
-| **Verify retries** | 2 verification retries per task before auto-fail |
-| **Re-entry lock** | Prevents double-firing of steering messages (try/finally sealed) |
-| **Cycle detection** | DFS-based dependency cycle detection in quest_plan |
-| **Depth limit** | Maximum dependency depth of 3 enforced |
-| **Crash recovery** | agent_end handler wrapped in try/catch — pauses quest on error |
+| Guard               | Behavior                                                            |
+| ------------------- | ------------------------------------------------------------------- |
+| **Max burst**       | Auto-pauses after 6 consecutive tasks — `/quest resume` to continue |
+| **Stall detection** | Same task 3 times without progress → pauses                         |
+| **Retry limit**     | 2 retries per task, then auto-marked failed                         |
+| **Verify retries**  | 2 verification retries per task before auto-fail                    |
+| **Re-entry lock**   | Prevents double-firing of steering messages (try/finally sealed)    |
+| **Cycle detection** | DFS-based dependency cycle detection in quest_plan                  |
+| **Depth limit**     | Maximum dependency depth of 3 enforced                              |
+| **Crash recovery**  | agent_end handler wrapped in try/catch — pauses quest on error      |
 
 ### Lifecycle
 
@@ -69,38 +69,38 @@ pi install git:github.com/dvictor357/pi-quest
 
 ### Commands
 
-| Command | Does |
-|---------|------|
-| `/quest` | Open kanban board (or status text in headless) |
-| `/quest create <name>: <goal>` | Create a new quest + auto-inject planning prompt |
-| `/quest start` | Manually start a quest |
-| `/quest pause` | Pause auto-pilot |
-| `/quest resume` | Resume auto-pilot |
-| `/quest approve` | Approve a plan (when planningMode=approve) |
-| `/quest cancel` | Abort and archive the current quest |
-| `/quest kanban` | Open kanban board overlay |
-| `/quest status` | Full quest progress with task list |
-| `/quest git` | Show git integration config + recorded commits |
-| `/quest history [N]` | Browse past completed quests |
-| `/quest team [list\|install <url>\|create]` | Manage team configurations |
+| Command                                     | Does                                             |
+| ------------------------------------------- | ------------------------------------------------ |
+| `/quest`                                    | Open kanban board (or status text in headless)   |
+| `/quest create <name>: <goal>`              | Create a new quest + auto-inject planning prompt |
+| `/quest start`                              | Manually start a quest                           |
+| `/quest pause`                              | Pause auto-pilot                                 |
+| `/quest resume`                             | Resume auto-pilot                                |
+| `/quest approve`                            | Approve a plan (when planningMode=approve)       |
+| `/quest cancel`                             | Abort and archive the current quest              |
+| `/quest kanban`                             | Open kanban board overlay                        |
+| `/quest status`                             | Full quest progress with task list               |
+| `/quest git`                                | Show git integration config + recorded commits   |
+| `/quest history [N]`                        | Browse past completed quests                     |
+| `/quest team [list\|install <url>\|create]` | Manage team configurations                       |
 
 ### Agent tools
 
-| Tool | Used by agent to |
-|------|-----------------|
-| `quest_create` | Create a new quest from a goal |
-| `quest_plan` | Save a task breakdown (after scout + planner) |
-| `quest_update` | Mark a task done/failed/skipped with result |
-| `quest_approve` | Approve a plan (planningMode=approve) with optional edits |
-| `quest_decide` | Ask the user a branching decision |
-| `quest_abort` | Permanently archive and clear the current quest |
-| `quest_status` | Show current quest progress |
-| `quest_task_detail` | Get full context + timing for a specific task |
-| `quest_commit` | Record a git commit against a task |
-| `quest_git_summary` | Review all commits + generate PR summary |
-| `quest_team` | List available team configurations |
-| `quest_history` | Browse past quests |
-| `quest_memory_save` | Save research findings to quest + project memory |
+| Tool                | Used by agent to                                          |
+| ------------------- | --------------------------------------------------------- |
+| `quest_create`      | Create a new quest from a goal                            |
+| `quest_plan`        | Save a task breakdown (after scout + planner)             |
+| `quest_update`      | Mark a task done/failed/skipped with result               |
+| `quest_approve`     | Approve a plan (planningMode=approve) with optional edits |
+| `quest_decide`      | Ask the user a branching decision                         |
+| `quest_abort`       | Permanently archive and clear the current quest           |
+| `quest_status`      | Show current quest progress                               |
+| `quest_task_detail` | Get full context + timing for a specific task             |
+| `quest_commit`      | Record a git commit against a task                        |
+| `quest_git_summary` | Review all commits + generate PR summary                  |
+| `quest_team`        | List available team configurations                        |
+| `quest_history`     | Browse past quests                                        |
+| `quest_memory_save` | Save research findings to quest + project memory          |
 
 ### Example workflow
 
