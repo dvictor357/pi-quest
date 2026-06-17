@@ -18,6 +18,7 @@ import {
   MAX_VERIFY_RETRIES,
   MAX_DEPENDENCY_DEPTH,
   TEAMS_DIR,
+  FORMAT_DIRECTIVE,
 } from "./constants";
 import { readJSON, writeJSON, projectMemoryPath } from "./utils";
 import {
@@ -925,6 +926,7 @@ export default function (pi: ExtensionAPI) {
                   `1. Does the result match the task requirements?`,
                   `2. Is the implementation correct and complete?`,
                   `3. Are there any issues or missing pieces?`,
+                  `4. Is the code formatted and lint-clean per the project's own conventions? ${FORMAT_DIRECTIVE} If the project's formatter/linter was not run or leaves the tree dirty/inconsistent, this is a FAIL.`,
                   ``,
                   `**After verification, call quest_update with:**`,
                   `- **verifyOutcome="PASS"** and verifyEvidence if the result is correct`,

@@ -7,6 +7,19 @@ export const MAX_RETRIES = 2;
 export const MAX_VERIFY_RETRIES = 2;
 export const MAX_DEPENDENCY_DEPTH = 3;
 
+/**
+ * Language-agnostic code-hygiene directive injected into steering and verification.
+ * It deliberately names no specific tool or language — the agent must detect and
+ * use whatever formatter/linter the project itself already relies on.
+ */
+export const FORMAT_DIRECTIVE = [
+	"**Before marking a code task done:** apply this project's own formatting and lint conventions.",
+	"Detect the tooling the codebase already uses — a format/lint script in its manifest, a config file",
+	"(e.g. .editorconfig or a formatter/linter config), or the standard tool for its language/ecosystem —",
+	"then run it and confirm the working tree is clean and consistent. Do NOT assume a specific language",
+	"or tool, and do NOT impose a style the project doesn't already use; adapt to this codebase.",
+].join(" ");
+
 export const AGENT_DIR = join(homedir(), ".pi", "agent");
 export const ACTIVE_PATH = join(AGENT_DIR, "quests", "active.json");
 export const ARCHIVE_DIR = join(AGENT_DIR, "quests", "archive");
