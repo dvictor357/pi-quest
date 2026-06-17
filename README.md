@@ -1,5 +1,9 @@
 # pi-quest
 
+> [!WARNING]
+> **Deprecated — this project now lives in [pi-suite](https://github.com/dvictor357/pi-suite).**
+> Development has moved to the consolidated `pi-suite` repository. This repo is archived and read-only; please use pi-suite going forward.
+
 Proactive AI project manager for [pi](https://pi.dev). Give it a goal and it **plans, delegates, verifies, and pushes forward autonomously** — no hand-holding needed.
 
 Built on top of pi's sub-agent system. Quest orchestrates the entire flow: scout the codebase, plan the work, delegate to specialized agents, verify results, and keep going until the job is done.
